@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  pipeline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r pipeline/requirements.txt pytest
+      - name: Run pipeline unit tests
+        working-directory: pipeline
+        run: python -m pytest tests/ -q
+
+  api-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          pip install -r api/requirements.txt pytest
+      - name: Run API unit tests (SQLite + mocked OpenSearch)
+        working-directory: api
+        env:
+          DATABASE_URL: sqlite:///:memory:
+          JWT_SECRET: ci-secret
+        run: python -m pytest tests/ -q
+
+  ui-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install & build UI
+        working-directory: ui
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  compose-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file
+        run: |
+          cp .env.example .env
+          docker compose config -q && echo "compose OK"

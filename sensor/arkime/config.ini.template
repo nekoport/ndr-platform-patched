@@ -1,0 +1,42 @@
+# Arkime config template - rendered by entrypoint.sh
+# Placeholders: @OPENSEARCH_URL@ @CAPTURE_IFACE@ @PASSWORD_SECRET@
+#               @FREESPACE_G@ @VIEW_PORT@ @PROXY_SECRET@
+
+[default]
+elasticsearch=@OPENSEARCH_URL@
+pcapDir=/opt/arkime/raw
+tcpDebugDir=/opt/arkime/raw
+interface=@CAPTURE_IFACE@
+passwordSecret=@PASSWORD_SECRET@
+freeSpaceG=@FREESPACE_G@
+viewPort=@VIEW_PORT@
+pcapWriteMethod=simple
+pcapWriteSize=2560000
+# v0.12.5: mirrored SPAN traffic carries GRO/GSO super-frames (~17 KB);
+# the default snapLen (16384) made capture exit FATAL in a restart loop.
+# 65535 covers jumbo/GRO frames; watch for frames >64 KB (MPLS-inside-GRO
+# edge cases) before raising further.
+snapLen=65535
+maxStreams=2000000
+dbBulkSize=6000000
+packetsPerPoll=50000
+packetsPerEsRequest=1000
+autoDetect=true
+logUnknownProtocols=false
+logESRequests=true
+logHTTPConnections=false
+viewHost=0.0.0.0
+# SSO via NDR API proxy (header auth): the viewer accepts ONLY requests
+# carrying BOTH headers below (direct browser hits get 401); the proxy
+# asserts the NDR username so the same login works with no second password.
+# Unknown users auto-provision on first jump (roles below, packetSearch on).
+userNameHeader=x-ndr-user
+requiredAuthHeader=x-ndr-proxy-key
+requiredAuthHeaderVal=@PROXY_SECRET@
+userAutoCreateTmpl={"userId":"${this['x-ndr-user']}","userName":"${this['x-ndr-user']}","enabled":true,"webEnabled":true,"headerAuthEnabled":true,"emailSearch":true,"removeEnabled":false,"packetSearch":true,"settings":{},"welcomeMsgNum":1,"roles":["arkimeUser","wiseUser"]}
+# MUST carry a trailing slash: Arkime emits it verbatim as <base href>
+# in the HTML shell, and a slash-less base makes browsers resolve
+# relative asset URLs one segment too high (blank white page).
+webBasePath=/backend/api/arkime/
+# API proxy lives on docker bridge nets; the header secret stays mandatory.
+userAuthIps=127.0.0.0/8,172.16.0.0/12,::1

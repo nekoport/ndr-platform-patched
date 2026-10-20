@@ -1,0 +1,267 @@
+%YAML 1.1
+---
+# NDR Suricata configuration - tuned for single VM (8 cores / 24 GB RAM)
+# Ingests SPAN/TAP traffic at 50-100 Mbps average, <1 Gbps peak.
+
+vars:
+  address-groups:
+    HOME_NET: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"
+    EXTERNAL_NET: "!$HOME_NET"
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+  port-groups:
+    # v0.12.5: token `460-660` (a RANGE in this YAML var) is rejected by
+    # Suricata 8.0.7 at parse time -> engine exited at boot. Removed; the
+    # remaining list matches the upstream ET default HTTP_PORTS. If you
+    # need extra ports, add concrete values (comma-separated), no ranges.
+    HTTP_PORTS: "80,81,443,591,631,1080,2480,3128,4031,5985,5986,6556,8000,8008,8020,8080,8090,8180,8443,9000,9502,9800"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNS_PORTS: "53,5353"
+
+# ---- Run mode ------------------------------------------------
+# workers mode pairs best with af-packet capture on multi-core hosts.
+runmode: workers
+
+# ---- Output --------------------------------------------------
+default-log-dir: /var/log/suricata
+
+outputs:
+  # eve.json is the ONLY pipeline input from Suricata.
+  # Kept types minimal to fit the 8c/24GB/3TB budget (flow excluded:
+  # Zeek conn.log + Arkime sessions already cover flow metadata).
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      community-id: yes
+      community-id-seed: 0
+      pcap-file: false
+      types:
+        - alert:
+            payload: no
+            payload-buffer-size: 4kb
+            payload-printable: no
+            packet: no
+            metadata: yes
+            http-body: no
+            http-body-printable: no
+        - dns:
+            version: 2
+            enabled: yes
+            requests: yes
+            responses: yes
+            formats: [detailed]
+        - http:
+            enabled: yes
+            metadata: yes
+        - tls:
+            enabled: yes
+            metadata: yes
+            session: false
+        - fileinfo
+        - stats
+
+  - stats:
+      enabled: yes
+      interval: 60
+      totals: yes
+      threads: no
+
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes
+    - file:
+        enabled: yes
+        level: info
+        filename: suricata.log
+
+# ---- Rules ---------------------------------------------------
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config
+threshold-file: /etc/suricata/threshold.config
+
+# ---- Capture -------------------------------------------------
+af-packet:
+  - interface: eth0
+    # Actual interface is supplied via CLI (-i), these defaults then apply:
+    threads: auto
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes
+    mmap-locked: yes
+    tpacket-v3: yes
+    ring-size: 204800
+    buffer-size: 64535
+    copy-mode: ips
+    copy-iface: eth1
+
+pcap:
+  - interface: eth0
+
+pcap-file:
+  checksum-checks: auto
+
+# ---- Detection engine ----------------------------------------
+detect:
+  profile: medium
+  custom-values:
+    toclient-groups: 200
+    toserver-groups: 200
+  sgh-mpm-context: auto
+  inspection-recursion-limit: 3000
+  rule-reload: true
+  group-tree-reload: false
+
+mpm-algo: auto
+spm-algo: auto
+secret-file: /var/lib/suricata/suricata.secret
+
+# ---- Stream / flow -------------------------------------------
+stream:
+  memcap: 512mb
+  checksum-validation: no     # SPAN often carries offloaded (bogus) checksums
+  inline: no
+  reassembly:
+    memcap: 1gb
+    depth: 1mb
+    toserver-chunk-size: 2560
+    toclient-chunk-size: 2560
+    randomize-chunk-size: no
+
+flow:
+  memcap: 512mb
+  hash-size: 65536
+  prealloc: 10000
+  emergency-recovery: 30
+
+flow-timeouts:
+  default:
+    new: 30
+    established: 300
+    closed: 0
+    bypassed: 100
+    emergency-new: 10
+    emergency-established: 100
+    emergency-closed: 0
+    emergency-bypassed: 50
+  tcp:
+    new: 60
+    established: 3600
+    closed: 60
+    bypassed: 100
+    emergency-new: 10
+    emergency-established: 300
+    emergency-closed: 10
+    emergency-bypassed: 50
+  udp:
+    new: 30
+    established: 300
+    bypassed: 100
+    emergency-new: 10
+    emergency-established: 100
+    emergency-bypassed: 50
+  icmp:
+    new: 30
+    established: 300
+    bypassed: 100
+    emergency-new: 10
+    emergency-established: 100
+    emergency-bypassed: 50
+
+host:
+  hash-size: 4096
+  prealloc: 1000
+  memcap: 32mb
+
+defrag:
+  memcap: 128mb
+  hash-size: 65536
+  trackers: 65535
+  max-frags: 65535
+  prealloc: yes
+  timeout: 60
+
+# ---- Application layer ---------------------------------------
+app-layer:
+  protocols:
+    telnet:
+      enabled: yes
+      detection-ports:
+        dp: 23
+    http:
+      enabled: yes
+      libhtp:
+        default-config:
+          personality: IDS
+          request-body-limit: 100kb
+          response-body-limit: 100kb
+          request-body-minimal-inspect-size: 32kb
+          request-body-inspect-window: 4kb
+          response-body-minimal-inspect-size: 40kb
+          response-body-inspect-window: 16kb
+          response-body-decompress-layer-limit: 2
+          http-body-inline: auto
+          swf-decompression:
+            enabled: yes
+            type: both
+            compress-depth: 0
+            decompress-depth: 0
+    ssh:
+      enabled: yes
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+      # JA3 fingerprinting is valuable for DGA/C2 heuristics
+      ja3-fingerprints: yes
+      encryption-handling: bypass
+    smtp:
+      enabled: yes
+    dns:
+      tcp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+      udp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+    files:
+      # Metadata (fileinfo) only - no on-disk extraction; PCAP is evidence
+      drop:
+        enabled: no
+
+# ---- Utilities ------------------------------------------------
+unix-command:
+  enabled: yes
+  # explicit path shared with the API container for live reload
+  filename: /var/run/suricata/suricata-command.socket
+
+host-mode: auto
+
+engine-analysis:
+  rules-fast-pattern: yes
+  rules: yes
+
+asn1-max-frames: 256
+
+# IPS copy-mode is disabled (IDS only). Copy settings above are inert
+# unless copy-mode is switched on intentionally.

@@ -1,0 +1,367 @@
+# ============================================================
+# NDR Platform - Phase 0-2 Foundation
+# Single-VM deployment (Ubuntu 24.04, 8c/24GB/3TB)
+#
+# Default profile  : opensearch, postgres, pipeline, api, ui
+# Sensor profile   : zeek, suricata, arkime (requires SPAN/TAP)
+# TLS profile      : gateway (HTTPS termination, v0.12)
+#
+#   docker compose --profile sensor up -d
+#   TLS_ENABLED=1 docker compose --profile tls up -d gateway
+# ============================================================
+
+name: ndr
+
+x-defaults: &defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "3"
+
+services:
+  # ---------------- Search / storage layer --------------------
+  opensearch:
+    <<: *defaults
+    image: ${OPENSEARCH_IMAGE}
+    container_name: ndr-opensearch
+    environment:
+      - cluster.name=ndr-cluster
+      - node.name=ndr-os-01
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP} -Xmx${OPENSEARCH_HEAP}
+      - DISABLE_SECURITY_PLUGIN=true
+      - path.repo=/usr/share/opensearch/snapshots
+      - cluster.routing.allocation.disk.watermark.low=${DISK_WATERMARK_LOW}%
+      - cluster.routing.allocation.disk.watermark.high=${DISK_WATERMARK_HIGH}%
+      - cluster.routing.allocation.disk.watermark.flood_stage=${DISK_WATERMARK_FLOOD}%
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ${NDR_DATA_ROOT}/opensearch:/usr/share/opensearch/data
+      - ${NDR_DATA_ROOT}/backup/opensearch-snapshots:/usr/share/opensearch/snapshots
+    ports:
+      - "127.0.0.1:${OPENSEARCH_HTTP_PORT}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -E 'yellow|green' >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    mem_limit: 8g
+
+  init-opensearch:
+    <<: *defaults
+    image: python:3.12-slim
+    container_name: ndr-os-init
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      - OS_URL=http://opensearch:9200
+      - RETENTION_DAYS=${RETENTION_DAYS}
+      - IOC_RETENTION_DAYS=${IOC_RETENTION_DAYS:-90}
+    volumes:
+      - ./opensearch/init:/init:ro
+    entrypoint: ["python3", "/init/bootstrap.py"]
+    restart: "no"
+
+  postgres:
+    <<: *defaults
+    image: ${POSTGRES_IMAGE}
+    container_name: ndr-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TZ=${TZ}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=100
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - ${NDR_DATA_ROOT}/postgres:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 1g
+
+  # ---------------- NDR application layer ---------------------
+  ndr-pipeline:
+    <<: *defaults
+    build:
+      context: ./pipeline
+    image: ndr/pipeline:latest
+    container_name: ndr-pipeline
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - SENSOR_ID=${SENSOR_ID}
+      - PIPELINE_SOURCES=${PIPELINE_SOURCES}
+      - PIPELINE_ZEEK_LOGS=${PIPELINE_ZEEK_LOGS}
+      - PIPELINE_SURICATA_TYPES=${PIPELINE_SURICATA_TYPES}
+      - OPENSEARCH_URL=http://opensearch:9200
+      - PIPELINE_BULK_MAX_ITEMS=${PIPELINE_BULK_MAX_ITEMS:-500}
+      - PIPELINE_BULK_FLUSH_SECONDS=${PIPELINE_BULK_FLUSH_SECONDS:-5}
+      - DETECT_PORTSCAN_UNIQUE_PORTS=${DETECT_PORTSCAN_UNIQUE_PORTS:-100}
+      - DETECT_PORTSCAN_UNIQUE_HOSTS=${DETECT_PORTSCAN_UNIQUE_HOSTS:-50}
+      - DETECT_PORTSCAN_WINDOW_MIN=${DETECT_PORTSCAN_WINDOW_MIN:-10}
+      - DETECT_BEACON_WINDOW_MIN=${DETECT_BEACON_WINDOW_MIN:-10}
+      - DETECT_NXDOMAIN_MIN_COUNT=${DETECT_NXDOMAIN_MIN_COUNT:-20}
+      - DETECT_NXDOMAIN_RATIO=${DETECT_NXDOMAIN_RATIO:-0.5}
+      - DETECT_BEACON_MIN_CONNECTIONS=${DETECT_BEACON_MIN_CONNECTIONS:-20}
+      - DETECT_BEACON_INTERVAL_MIN_SEC=${DETECT_BEACON_INTERVAL_MIN_SEC:-10}
+      - DETECT_BEACON_INTERVAL_MAX_SEC=${DETECT_BEACON_INTERVAL_MAX_SEC:-3600}
+      - DETECT_BEACON_JITTER_MAX=${DETECT_BEACON_JITTER_MAX:-0.2}
+      # threat intelligence (doc 9, Phase 3)
+      - TI_ENABLED=${TI_ENABLED:-true}
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - TI_JOB_POLL_SECONDS=${TI_JOB_POLL_SECONDS:-5}
+      - TI_RELOAD_SECONDS=${TI_RELOAD_SECONDS:-60}
+      - TI_HTTP_TIMEOUT=${TI_HTTP_TIMEOUT:-30}
+      - TI_VERIFY_TLS=${TI_VERIFY_TLS:-true}
+      - TI_AUTO_SCHEDULE=${TI_AUTO_SCHEDULE:-true}
+      - TI_DEFAULT_TTL_DAYS=${TI_DEFAULT_TTL_DAYS:-14}
+      # ---- Phase 4: attack reconstruction (doc section 10) ----
+      - RECON_ENABLED=${RECON_ENABLED:-true}
+      - RECON_MAX_GAP_SECONDS=${RECON_MAX_GAP_SECONDS:-7200}
+      - RECON_LOOKBACK_HOURS=${RECON_LOOKBACK_HOURS:-24}
+      - RECON_MAX_ACTIVE_STORIES=${RECON_MAX_ACTIVE_STORIES:-500}
+      - RECON_PERSIST_SECONDS=${RECON_PERSIST_SECONDS:-10}
+      - DETECT_WINDOW_MIN=${DETECT_WINDOW_MIN:-10}
+      - DETECT_FILE_MIN_BYTES=${DETECT_FILE_MIN_BYTES:-5000000}
+      - DETECT_DGA_MIN_UNIQUE=${DETECT_DGA_MIN_UNIQUE:-10}
+      - DETECT_DGA_ENTROPY_MIN=${DETECT_DGA_ENTROPY_MIN:-3.5}
+      - DETECT_TUNNEL_MIN_COUNT=${DETECT_TUNNEL_MIN_COUNT:-10}
+      - DETECT_TUNNEL_MIN_LABEL_LEN=${DETECT_TUNNEL_MIN_LABEL_LEN:-40}
+      - DETECT_LATERAL_PORTS=${DETECT_LATERAL_PORTS:-22,135,139,445,3389,5985,5986}
+      - DETECT_LATERAL_MIN_CONNS=${DETECT_LATERAL_MIN_CONNS:-20}
+      - DETECT_LATERAL_CROSS_ZONE_MIN=${DETECT_LATERAL_CROSS_ZONE_MIN:-5}
+      - DETECT_EXFIL_MIN_BYTES=${DETECT_EXFIL_MIN_BYTES:-100000000}
+      # ---- Phase 5: optional GeoIP enrichment (threat map) ----
+      # Mount a GeoLite2 mmdb or a generated JSON sidecar to enable.
+      # Without them geo fields stay absent and the Threat Map lists
+      # unmapped addresses instead of guessing locations.
+      - GEOIP_MMDB_PATH=${GEOIP_MMDB_PATH:-}
+      - GEOIP_JSON_PATH=${GEOIP_JSON_PATH:-}
+      - METRICS_PORT=9100
+    volumes:
+      - ${NDR_DATA_ROOT}/zeek/logs:/input/zeek:ro
+      - ${NDR_DATA_ROOT}/suricata/logs:/input/suricata:ro
+      - ndr-pipeline-state:/data/state
+    ports:
+      - "127.0.0.1:9100:9100"
+    mem_limit: 1500m
+
+  ndr-api:
+    <<: *defaults
+    build:
+      context: ./api
+    image: ndr/api:latest
+    container_name: ndr-api
+    environment:
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - OPENSEARCH_URL=http://opensearch:9200
+      # v0.13.0: honour X-Forwarded-For ONLY behind the TLS gateway/proxy
+      - TRUST_PROXY=${TRUST_PROXY:-0}
+      - JWT_SECRET=${JWT_SECRET}
+      - ACCESS_TOKEN_MINUTES=${ACCESS_TOKEN_MINUTES:-30}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - LOGIN_MAX_FAILED=${LOGIN_MAX_FAILED:-5}
+      - LOGIN_LOCKOUT_MINUTES=${LOGIN_LOCKOUT_MINUTES:-15}
+      - SENSOR_ID=${SENSOR_ID}
+      - RETENTION_DAYS=${RETENTION_DAYS}
+      - PCAP_DIR=${PCAP_DIR:-/var/lib/ndr/pcap}
+      - PCAP_EXPORT_TTL_MINUTES=${PCAP_EXPORT_TTL_MINUTES:-60}
+      - PCAP_EXPORT_MAX_FILES=${PCAP_EXPORT_MAX_FILES:-5}
+      - PCAP_EXPORT_MAX_BYTES=${PCAP_EXPORT_MAX_BYTES:-2000000000}
+      - PCAP_SESSION_BUFFER_MINUTES=${PCAP_SESSION_BUFFER_MINUTES:-5}
+      - ARKIME_VIEWER_URL=${ARKIME_VIEWER_URL:-http://127.0.0.1:8005}
+      - ARKIME_PUBLIC_BASE=${ARKIME_PUBLIC_BASE:-}
+      - ARKIME_PROXY_SECRET=${ARKIME_PROXY_SECRET:-}
+      # TLS hardening (v0.12): Secure cookie + HSTS when served via HTTPS
+      - TLS_ENABLED=${TLS_ENABLED:-0}
+    volumes:
+      # Rule manager (Phase 6): shared rules volume + suricata config for
+      # suricata-update + unix command socket for live reload.
+      - ./sensor/suricata/rules:/var/lib/suricata/rules
+      - ./sensor/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+      - suricata-run:/var/run/suricata
+      # v0.12.7: Zeek policy inventory for the Rule Manager "zeek" tab
+      # (read-only parse of the @load statements - never modified here)
+      - ./sensor/zeek/local.zeek:/opt/ndr/zeek/local.zeek:ro
+      # PCAP & evidence workflow (doc 15): read-only access to the Arkime
+      # capture directory + writable staging area for export bundles.
+      - ${NDR_DATA_ROOT}/pcap:/var/lib/ndr/pcap:ro
+      - ${NDR_DATA_ROOT}/pcap-exports:/var/lib/ndr/pcap-exports
+    depends_on:
+      init-rules:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${API_PORT}:8080"
+    mem_limit: 750m
+
+  ndr-ui:
+    <<: *defaults
+    build:
+      context: ./ui
+    image: ndr/ui:latest
+    container_name: ndr-ui
+    depends_on:
+      - ndr-api
+    environment:
+      - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-http://ndr-api:8080}
+      - NEXT_PUBLIC_DEMO_MODE=${NEXT_PUBLIC_DEMO_MODE:-false}
+      - NODE_ENV=production
+    ports:
+      - "${UI_PORT}:3000"
+    mem_limit: 500m
+
+  # ---------------- TLS gateway (profile: tls, v0.12) ----------
+  # HTTPS termination for UI + API. Requires certificates first:
+  #   ./scripts/gen-certs.sh ndr.local
+  # then:
+  #   TLS_ENABLED=1 docker compose --profile tls up -d gateway
+  # Browsers must trust deploy/tls/ca.crt (self-signed lab PKI) or
+  # replace server.crt/key with a CA-issued pair.
+  gateway:
+    <<: *defaults
+    image: nginx:1.27-alpine
+    container_name: ndr-gateway
+    profiles: ["tls"]
+    depends_on:
+      - ndr-api
+      - ndr-ui
+    ports:
+      - "${TLS_HTTP_PORT:-80}:80"
+      - "${TLS_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/tls/nginx-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/tls/server.crt:/etc/nginx/certs/server.crt:ro
+      - ./deploy/tls/server.key:/etc/nginx/certs/server.key:ro
+      - ./deploy/tls/ca.crt:/etc/nginx/certs/ca.crt:ro
+    mem_limit: 128m
+
+  # ---------------- Sensor layer (profile: sensor) ------------
+  zeek:
+    <<: *defaults
+    profiles: ["sensor"]
+    build:
+      context: ./sensor/zeek
+      args:
+        ZEEK_IMAGE: ${ZEEK_IMAGE:-zeek/zeek:lts}
+    image: ndr/zeek:latest
+    container_name: ndr-zeek
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    environment:
+      - CAPTURE_IFACE=${CAPTURE_IFACE}
+      - TZ=${TZ}
+    volumes:
+      - ./sensor/zeek/node.cfg.tmpl:/templates/node.cfg.tmpl:ro
+      - ${NDR_DATA_ROOT}/zeek/logs:/usr/local/zeek/logs
+    mem_limit: 3g
+
+  # One-shot: bind volumes that must be writable by the API user
+  # (uid 10002) - the rule manager (disable.conf) and the PCAP export
+  # staging area.
+  init-rules:
+    <<: *defaults
+    image: python:3.12-slim
+    container_name: ndr-rules-init
+    restart: "no"
+    entrypoint:
+      ["sh", "-c", "mkdir -p /rules && chown -R 10002:10002 /rules && mkdir -p /pcap-exports && chown 10002:10002 /pcap-exports"]
+    volumes:
+      - ./sensor/suricata/rules:/rules
+      - ${NDR_DATA_ROOT}/pcap-exports:/pcap-exports
+
+  suricata:
+    <<: *defaults
+    profiles: ["sensor"]
+    build:
+      context: ./sensor/suricata
+      args:
+        - SURICATA_IMAGE=${SURICATA_IMAGE:-jasonish/suricata:8.0}
+    image: ndr/suricata:latest
+    container_name: ndr-suricata
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    command: ["-c", "/etc/suricata/suricata.yaml", "-i", "${CAPTURE_IFACE}"]
+    environment:
+      - SURICATA_API_UID=${SURICATA_API_UID:-10002}
+      - TZ=${TZ}
+    volumes:
+      - ./sensor/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+      - ./sensor/suricata/rules:/var/lib/suricata/rules
+      - ${NDR_DATA_ROOT}/suricata/logs:/var/log/suricata
+      - suricata-run:/var/run/suricata
+    mem_limit: 4g
+
+  arkime:
+    <<: *defaults
+    profiles: ["sensor"]
+    build:
+      context: ./sensor/arkime
+      args:
+        - ARKIME_VERSION=${ARKIME_VERSION:-5.6.2}
+    image: ndr/arkime:latest
+    container_name: ndr-arkime
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - IPC_LOCK
+    environment:
+      - CAPTURE_IFACE=${CAPTURE_IFACE}
+      - ARKIME_PASSWORD_SECRET=${ARKIME_PASSWORD_SECRET}
+      - ARKIME_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - OPENSEARCH_URL=http://127.0.0.1:${OPENSEARCH_HTTP_PORT}
+      - ARKIME_FREESPACE_G=${ARKIME_FREESPACE_G:-40}
+      - ARKIME_WEB_PORT=${ARKIME_WEB_PORT:-8005}
+      - ARKIME_PROXY_SECRET=${ARKIME_PROXY_SECRET:-}
+      - TZ=${TZ}
+    volumes:
+      - ${NDR_DATA_ROOT}/pcap:/opt/arkime/raw
+      - ./sensor/arkime/config.ini.template:/opt/arkime/etc/config.ini.template:ro
+      - ./sensor/arkime/entrypoint.sh:/entrypoint.sh:ro
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    mem_limit: 2g
+
+volumes:
+  ndr-pipeline-state:
+  suricata-run:

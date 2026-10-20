@@ -1,0 +1,10 @@
+deploy/tls/*.key
+deploy/tls/*.crt
+deploy/tls/ca*
+*.log
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.playwright-mcp/
+*.tar.gz

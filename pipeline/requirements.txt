@@ -1,0 +1,4 @@
+opensearch-py>=2.4,<3
+orjson>=3.9
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.1,<4

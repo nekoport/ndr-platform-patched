@@ -1,0 +1,10 @@
+{"type": "ip", "value": "185.222.57.11", "confidence": "high", "malware": "Emotet", "published": "2026-09-01T00:00:00Z", "reference": "https://example.test/ioc/1"}
+{"type": "domain", "value": "C2.Evil-Example.test", "confidence": "medium", "malware": "CobaltStrike", "published": "2026-09-02T00:00:00Z"}
+{"type": "url", "value": "http://payload.evil-example.test/1.exe", "confidence": "medium", "malware": "AgentTesla"}
+{"type": "sha256", "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "confidence": "low", "malware": "test-hash"}
+{"type": "md5", "value": "D41D8CD98F00B204E9800998ECF8427E", "confidence": "low"}
+{"type": "ip", "value": "10.0.0.5", "confidence": "high", "malware": "must-be-rejected-private"}
+{"type": "ip", "value": "127.0.0.1", "confidence": "high", "malware": "must-be-rejected-loopback"}
+{"type": "domain", "value": "not a domain!!", "confidence": "high"}
+{"type": "unknown-type", "value": "whatever", "confidence": "high"}
+{"value": "203.0.113.66", "confidence": "high", "malware": "type-sniffed"}

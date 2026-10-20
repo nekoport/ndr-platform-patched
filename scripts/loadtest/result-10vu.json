@@ -1,0 +1,14 @@
+{
+  "vus": 10,
+  "duration_s": 20,
+  "wall_s": 20.1,
+  "requests": 2638,
+  "rps": 131.4,
+  "errors": 0,
+  "error_pct": 0.0,
+  "latency_ms": {
+    "p50": 28.8,
+    "p95": 102.9,
+    "p99": 283.8
+  }
+}

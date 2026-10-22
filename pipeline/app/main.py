@@ -33,6 +33,7 @@ from app.normalize import parse_suricata, parse_zeek
 from app.sink.deadletter import DeadLetterWriter
 from app.sink.opensearch import OpenSearchSink
 from app.sink.raw_archive import RawArchive, RawArchiveMaintainer
+from app.sink.replay import DeadLetterReplayer
 from app.tailer import Tailer
 from app.validate import validate_event
 
@@ -98,11 +99,27 @@ class Pipeline:
         self.sink = OpenSearchSink(
             self.cfg.opensearch_url, self.sink_queue, self.cfg, self.metrics,
             deadletter=self.deadletter, flush_seconds=self.cfg.bulk_flush_seconds,
-            max_items=self.cfg.bulk_max_items, max_retries=self.cfg.bulk_max_retries)
+            max_items=self.cfg.bulk_max_items, max_retries=self.cfg.bulk_max_retries,
+            # v0.16.2 (BUG-0161-04): breaker anti-saturasi OpenSearch
+            cooldown_max_seconds=self.cfg.sink_cooldown_max_seconds,
+            batch_min_items=self.cfg.sink_batch_min_items)
         self.raw_maintainer = RawArchiveMaintainer(self.raw_archive)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = [
             self.tailer, self.detection, self.sink, self.raw_maintainer]
+        # v0.16.2 (BUG-0161-04): replay deadletter sink_timeout/sink_failure
+        # secara berkala (idempoten by _id). Kill switch: PIPELINE_DLQ_REPLAY=0.
+        if self.cfg.dlq_replay_enabled:
+            self.dlq_replayer = DeadLetterReplayer(
+                self.cfg, self.sink_queue, self.metrics, self.deadletter)
+            self._threads.append(self.dlq_replayer)
+            print("[ndr-pipeline] deadletter replay enabled "
+                  f"(interval={self.cfg.dlq_replay_interval_seconds}s)",
+                  file=sys.stderr)
+        else:
+            self.dlq_replayer = None
+            print("[ndr-pipeline] deadletter replay DISABLED "
+                  "(PIPELINE_DLQ_REPLAY=0)", file=sys.stderr)
         # ---- threat intelligence (doc section 9, Phase 3) -------------
         self.intel: IntelService | None = None
         if self.cfg.ti_enabled:
@@ -246,6 +263,15 @@ class Pipeline:
             self.sink_queue.put((index, doc_id, doc))
 
     def _process_loop(self) -> None:
+        # v0.16.2 (BUG-0161-04): pacing catch-up - saat backlog tailer >
+        # ambang (pasca-restart/downtime), tidur singkat tiap N event agar
+        # indexing tidak menenggelamkan OpenSearch (kasus 297 MB -> 4.807
+        # sink_timeout). Kill switch: PIPELINE_CATCHUP_PACE_THRESHOLD_SECONDS=0.
+        pace_threshold = self.cfg.catchup_pace_threshold_seconds
+        pace_batch = max(1, self.cfg.catchup_pace_batch)
+        pace_sleep = max(0, self.cfg.catchup_pace_sleep_ms) / 1000.0
+        since_pace = 0
+        pacing = False
         while not self._stop.is_set() or not self.raw_queue.empty():
             try:
                 path, line = self.raw_queue.get(timeout=0.5)
@@ -261,6 +287,28 @@ class Pipeline:
                     pass
             finally:
                 self.raw_queue.task_done()
+            if pace_threshold > 0 and pace_sleep > 0:
+                since_pace += 1
+                if since_pace >= pace_batch:
+                    since_pace = 0
+                    backlog = self.metrics.snapshot().get("backlog_seconds")
+                    if isinstance(backlog, (int, float)) \
+                            and backlog > pace_threshold:
+                        if not pacing:
+                            pacing = True
+                            self.metrics.set_gauge("catchup_pacing", 1)
+                            print(f"[ndr-pipeline] catch-up pacing AKTIF "
+                                  f"(backlog {backlog:.0f}s > "
+                                  f"{pace_threshold:.0f}s; tidur "
+                                  f"{pace_sleep * 1000:.0f}ms per "
+                                  f"{pace_batch} event)", file=sys.stderr)
+                        import time as _t
+                        _t.sleep(pace_sleep)
+                    elif pacing:
+                        pacing = False
+                        self.metrics.set_gauge("catchup_pacing", 0)
+                        print("[ndr-pipeline] catch-up pacing selesai "
+                              "(backlog normal)", file=sys.stderr)
 
     # -------------------------------------------------------------- control
     def start(self) -> None:

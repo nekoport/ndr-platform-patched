@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,6 +110,7 @@ def on_startup() -> None:
     _migrate_v012_columns()
     _migrate_ti_adapter_check()
     _migrate_v016_columns()
+    _normalize_legacy_branding()
     db = SessionLocal()
     try:
         bootstrap_admin(db)
@@ -121,6 +124,40 @@ def on_startup() -> None:
         app.state.rule_stats_refresher = RuleStatsRefresher(
             config.rule_stats_refresh_minutes)
         app.state.rule_stats_refresher.start()
+
+
+# v0.16.2 (BUG-0161-07 / P2-2): nama produk LAMA (sebelum rebrand) bisa
+# tersimpan permanen di tabel system_settings dan mengalahkan default
+# "NDR Console" - di lapangan tab browser & sidebar menampilkan
+# "Ever SEEN" sementara halaman login memakai "NDR Console". Normalisasi
+# idempoten ini mengembalikan nama konsisten SEKALI saat startup; nama
+# kustom yang diset operator SETELAH itu dihormati penuh.
+_LEGACY_BRAND_NAMES = {"ever seen", "everseen", "ever-seen", "ever seen ndr",
+                       "ever seen ndr console"}
+
+
+def _normalize_legacy_branding() -> None:
+    from sqlalchemy.orm import Session as _Session
+
+    from app.models import SystemSetting
+    db: _Session = SessionLocal()
+    try:
+        row = db.get(SystemSetting, "system")
+        if row and isinstance(row.value, dict):
+            name = str(row.value.get("name") or "").strip()
+            if name.lower() in _LEGACY_BRAND_NAMES:
+                row.value = {**row.value, "name": "NDR Console"}
+                row.updated_at = datetime.now(timezone.utc)
+                row.updated_by = "system"
+                db.commit()
+                logging.getLogger("uvicorn.error").info(
+                    "system_settings.name '%s' (branding lama) dinormalkan "
+                    "ke 'NDR Console' (konsistensi UI)", name)
+    except Exception as exc:  # noqa: BLE001 - normalisasi tidak boleh blok
+        logging.getLogger("uvicorn.error").warning(
+            "normalisasi branding dilewati: %s", exc)
+    finally:
+        db.close()
 
 
 def _migrate_v016_columns() -> None:

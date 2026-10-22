@@ -82,8 +82,9 @@ class _Deadletter:
     def __init__(self):
         self.entries: list[tuple] = []
 
-    def write(self, reason, doc_id="", doc=None, raw=""):
-        self.entries.append((reason, doc_id))
+    def write(self, reason, doc_id="", doc=None, raw="", index=""):
+        # v0.16.2 (BUG-0161-04): record kini membawa index tujuan
+        self.entries.append((reason, doc_id, index))
 
 
 @pytest.fixture()
@@ -136,7 +137,7 @@ def test_a2_timeout_goes_to_deadletter_without_retry(sink_factory, monkeypatch):
     monkeypatch.setattr(sink_mod.helpers, "bulk", _bulk)
     s._flush([("ndr-alerts-2026.10.19", "id1", {"alert_type": "x"})])
     assert attempts["n"] == 1            # NO second attempt (anti-wedge)
-    assert [r for r, _ in dl.entries] == ["sink_timeout"]
+    assert [r for r, _, _ in dl.entries] == ["sink_timeout"]
     assert dl.entries[0][1] == "id1"
 
 
@@ -154,7 +155,7 @@ def test_a2_retryable_errors_retry_then_sink_failure(sink_factory, monkeypatch):
     s._flush([("ndr-suricata-2026.10.19", "id1", {"x": 1})])
     assert attempts["n"] == 3            # retried up to max_retries
     assert len(sleeps) == 2              # backoff between attempts only
-    assert [r for r, _ in dl.entries] == ["sink_failure"]
+    assert [r for r, _, _ in dl.entries] == ["sink_failure"]
 
 
 def test_a2_per_item_errors_still_index_error(sink_factory, monkeypatch):
@@ -167,7 +168,7 @@ def test_a2_per_item_errors_still_index_error(sink_factory, monkeypatch):
 
     monkeypatch.setattr(sink_mod.helpers, "bulk", _bulk)
     s._flush([("ndr-x", "id1", {"x": 1})])
-    assert [r for r, _ in dl.entries] == ["index_error"]
+    assert [r for r, _, _ in dl.entries] == ["index_error"]
 
 
 # ---------------------------------------------------------------- B1 ensure

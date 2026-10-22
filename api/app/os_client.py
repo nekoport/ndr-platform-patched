@@ -12,6 +12,7 @@ Advanced DSL is exposed ONLY through this guard:
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -270,7 +271,9 @@ class OSClient:
 
     def guarded_aggregate(self, *, alias: str | list[str], query: dict | None,
                           aggs: dict, time_from: str | None,
-                          time_to: str | None) -> dict:
+                          time_to: str | None,
+                          allow_partial: bool = False,
+                          concrete: list[str] | None = None) -> dict:
         """Aggregation-only search over a whitelisted alias (v0.12.7).
 
         Mirrors guarded_search (same alias whitelist, same query guard,
@@ -283,8 +286,38 @@ class OSClient:
         ndr-zeek-tls-read + ndr-suricata-read) sehingga agregasi TLS
         mencakup JA3/issuer dari Suricata EVE juga - fan-out multi-alias
         adalah operasi search normal di OpenSearch.
+
+        v0.16.2 (BUG-0161-05): guard hasil PARSHAL. Dulu jika satu shard
+        gagal (mis. index lama memetakan field agregasi sebagai `text`
+        tanpa fielddata) respons tetap dikembalikan TANPA peringatan ->
+        angka kurang terhitung yang terlihat normal (silent partial).
+        Kini:
+          * allow_partial=False (default): `_shards.failed > 0` menolak
+            hasil dengan DSLValidationError - caller menerjemahkannya
+            menjadi HTTP 400 dengan pesan jelas (tidak ada angka bisu).
+          * allow_partial=True: hasil parsial diterima TAPI selalu
+            di-log WARNING + hasil diberi kunci `_ndr_partial_shards`
+            agar caller yang sadar bisa menampilkan peringatan.
+
+        v0.16.2: parameter `concrete` (opsional) menjalankan agregasi pada
+        DAFTAR INDEX KONKRET alih-alih alias - dipakai endpoint timeline
+        untuk memisahkan kelompok mapping keyword lama/baru. Keamanan
+        tetap terjaga: setiap index konkret WAJIB anggota alias whitelist
+        yang divalidasi (resolve_alias_indices), selain itu ditolak.
         """
         alias = self.validate_alias(alias)
+        target: str | list[str] = alias
+        if concrete:
+            if isinstance(alias, list):
+                raise DSLValidationError(
+                    "concrete hanya boleh dipakai dengan SATU alias")
+            member = self.resolve_alias_indices(alias)
+            bad = [c for c in concrete if c not in member]
+            if bad:
+                raise DSLValidationError(
+                    f"index konkret bukan anggota alias '{alias}': "
+                    f"{', '.join(bad)}")
+            target = list(concrete)
         query = query or {}
         self.validate_query(query)
         filters = [self.build_time_filter(time_from, time_to)]
@@ -296,10 +329,119 @@ class OSClient:
             "query": {"bool": {"filter": filters}},
             "aggs": aggs,
         }
-        return self.client.search(
-            index=alias, body=body,
+        result = self.client.search(
+            index=target, body=body,
             request_timeout=config.search_timeout_seconds,
         )
+        shards = result.get("_shards") or {}
+        failed = int(shards.get("failed") or 0)
+        if failed > 0:
+            sketch = "; ".join(
+                f"{f.get('index','?')}[{f.get('shard','?')}]: "
+                f"{(f.get('reason') or {}).get('type','?')}: "
+                f"{str((f.get('reason') or {}).get('reason','?'))[:160]}"
+                for f in (shards.get("failures") or [])[:4])
+            if allow_partial:
+                logging.getLogger("ndr.api.os").warning(
+                    "[aggregate] hasil PARSHAL: %d shard gagal (%s) - "
+                    "angka bisa kurang terhitung", failed, sketch)
+                result["_ndr_partial_shards"] = {
+                    "failed": failed, "failures": shards.get("failures") or []}
+            else:
+                raise DSLValidationError(
+                    f"agregasi parsial ditolak: {failed} shard gagal "
+                    f"({sketch}) - index lama dengan mapping tidak cocok "
+                    f"harus direindex/dihapus")
+        return result
+
+    # ------------------------------------------------ v0.16.2 (BUG-0161-05)
+    def resolve_alias_indices(self, alias: str) -> set[str]:
+        """Daftar index konkret di belakang SATU alias whitelist.
+
+        Dipakai untuk memverifikasi bahwa daftar index konkret hasil
+        resolusi field_caps benar-benar anggota alias whitelist - tidak
+        ada index di luar whitelist yang bisa diselundupkan.
+        """
+        alias = self.validate_alias(alias)
+        if isinstance(alias, list):
+            raise DSLValidationError("resolve_alias_indices butuh SATU alias")
+        try:
+            return set((self.client.indices.get_alias(name=alias) or {}).keys())
+        except Exception as exc:  # noqa: BLE001 - alias belum ada -> kosong
+            logging.getLogger("ndr.api.os").warning(
+                "[aggregate] resolve alias %s gagal: %s", alias, exc)
+            return set()
+
+    def keyword_aggregation_groups(self, alias: str,
+                                   field: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
+        """Kelompokkan index konkret di belakang alias berdasar varian
+        field yang siap-agregasi (v0.16.2, BUG-0161-05).
+
+        Latar: 6 index lama (2026.10.14) memetakan `source_engine` sebagai
+        `text` tanpa fielddata -> terms agg langsung pada field itu GAGAL
+        di shard tsb (silent partial). Index dinamis lama OTOMATIS punya
+        sub-field `source_engine.keyword` yang bisa diagregasi; index baru
+        (template eksplisit) memetakan `source_engine` langsung keyword.
+
+        Returns:
+          (groups, excluded)
+          groups  : list (agg_field, [index konkret]) - setiap kelompok
+                    aman untuk terms agg pada agg_field.
+          excluded: index konkret yang field-nya text TANPA sub-field
+                    .keyword - tidak bisa diagregasi, harus dilewati
+                    (caller wajib menampilkannya sebagai warning).
+
+        Index konkrit diverifikasi anggota alias whitelist sebelum
+        dikembalikan; field_caps dijalankan lewat alias (bukan nama
+        index bebas), jadi tidak ada index di luar whitelist.
+        """
+        alias = self.validate_alias(alias)
+        if isinstance(alias, list):
+            raise DSLValidationError("keyword_aggregation_groups butuh SATU alias")
+        try:
+            caps = self.client.field_caps(index=alias, fields=field)
+        except Exception as exc:  # noqa: BLE001 - alias belum ada/empty
+            logging.getLogger("ndr.api.os").warning(
+                "[aggregate] field_caps %s/%s gagal: %s", alias, field, exc)
+            return [(field, [])], []
+        member = self.resolve_alias_indices(alias)
+        all_idx = set(caps.get("indices") or []) & member
+        if not all_idx:
+            # field_caps tanpa daftar "indices" berarti SEMUA index di
+            # belakang alias memakai satu mapping yang sama.
+            all_idx = set(member)
+
+        direct_kw: set[str] = set()
+        text_idx: set[str] = set()
+        for cap_type, cap in (caps.get("fields", {}).get(field) or {}).items():
+            idx = set(cap.get("indices") or all_idx) & member
+            if cap_type == "text":
+                text_idx |= idx
+            else:
+                direct_kw |= idx
+        sub_kw: set[str] = set()
+        sub_path = f"{field}.keyword"
+        for cap_type, cap in (caps.get("fields", {}).get(sub_path) or {}).items():
+            if cap_type == "keyword":
+                sub_kw |= set(cap.get("indices") or all_idx) & member
+
+        groups: list[tuple[str, list[str]]] = []
+        if direct_kw:
+            groups.append((field, sorted(direct_kw)))
+        # index yang SUDAH memakai varian direct tidak perlu varian .keyword
+        sub_only = sub_kw - direct_kw
+        if sub_only:
+            groups.append((sub_path, sorted(sub_only)))
+        excluded = sorted(text_idx - sub_kw - direct_kw)
+        if excluded:
+            logging.getLogger("ndr.api.os").warning(
+                "[aggregate] %d index lama tidak bisa diagregasi pada '%s' "
+                "(mapping text tanpa sub-field keyword): %s",
+                len(excluded), field, ", ".join(excluded))
+        if not groups:
+            # fallback aman: jalankan pada alias apa adanya (perilaku lama)
+            return [(field, [])], excluded
+        return groups, excluded
 
     def get_by_id(self, alias: str, doc_id: str) -> dict | None:
         """Resolve satu dokumen by _id, AMAN untuk alias multi-index.

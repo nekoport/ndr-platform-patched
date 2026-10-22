@@ -141,6 +141,15 @@ export interface OverviewStats {
   alerts_by_status?: { key: string; count: number }[];
   top_alert_titles?: { key: string; count: number }[];
   alert_trend?: { ts: string; count: number }[];
+  // v0.16.2 (BUG-0161-02): angka nyata untuk Reports - dulu UI membaca
+  // timeline.alerts_* yang tidak pernah dikirim backend (selalu 0).
+  alerts_7d?: number;
+  events_7d?: number;
+  alert_daily_7d?: { day: string; alerts: number; critical: number;
+    high: number; medium: number; low: number }[];
+  mttr?: { day: string; mttr_hours: number; closed: number }[];
+  mttr_hours_avg?: number;
+  closed_7d?: number;
 }
 
 export interface SensorRow {
@@ -266,6 +275,9 @@ export interface TimelinePoint {
   alerts_high: number;
   alerts_medium: number;
   alerts_low: number;
+  /** v0.16.2 (BUG-0161-01): total eksak per bucket dari API (count =
+   *  seluruh engine); fallback zeek+suricata bila kosong. */
+  count?: number;
 }
 
 export interface TopItem {
@@ -359,6 +371,9 @@ export interface RichOverview {
   zone_traffic: ZoneTraffic[];
   eps_history: number[];          // last 60s sparkline source
   mttr: MtrPoint[];
+  /** v0.16.2 (BUG-0161-02): volume deteksi harian 7d + split severity
+   *  nyata dari stats.alert_daily_7d (dipakai chart Reports). */
+  alert_daily: TimelinePoint[];
   new_alerts_today: number;
   critical_open: number;
   mean_time_to_ack_min: number;

@@ -211,6 +211,10 @@ services:
       - ./sensor/suricata/rules:/var/lib/suricata/rules
       - ./sensor/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
       - suricata-run:/var/run/suricata
+      # v0.16.2 (BUG-0161-06): state persisten API untuk file secret JWT
+      # (/var/lib/ndr-api/jwt-secret.key) - fallback secret tanpa .env kini
+      # lintas-worker dan lintas-restart, bukan ephemeral per-worker.
+      - api-state:/var/lib/ndr-api
       # v0.12.7: Zeek policy inventory for the Rule Manager "zeek" tab
       # (read-only parse of the @load statements - never modified here)
       - ./sensor/zeek/local.zeek:/opt/ndr/zeek/local.zeek:ro
@@ -371,3 +375,4 @@ services:
 volumes:
   ndr-pipeline-state:
   suricata-run:
+  api-state:

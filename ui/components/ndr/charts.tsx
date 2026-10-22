@@ -93,6 +93,10 @@ export function SeverityStackedArea({ data, height = 220 }: { data: TimelinePoin
         <XAxis dataKey="ts" tick={{ fill: "#71717a", fontSize: 10 }} stroke="#3f3f46"
                tickFormatter={(v: string) => {
                  const d = new Date(v);
+                 // v0.16.2 (BUG-0161-02): dukung bucket harian (ts "YYYY-MM-DD")
+                 if (v && v.length === 10 && !v.includes("T")) {
+                   return `${d.getDate()}/${d.getMonth() + 1}`;
+                 }
                  return `${d.getDate()}/${d.getHours()}:00`;
                }} minTickGap={48} />
         <YAxis tick={{ fill: "#71717a", fontSize: 10 }} stroke="#3f3f46" allowDecimals={false} />

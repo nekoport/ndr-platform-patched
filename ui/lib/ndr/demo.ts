@@ -205,6 +205,26 @@ function buildTimeline(): TimelinePoint[] {
 }
 export const demoTimeline: TimelinePoint[] = buildTimeline();
 
+// v0.16.2 (BUG-0161-02): agregasi harian 7d + split severity utk Reports
+// (demo mode) - mencerminkan stats.alert_daily_7d pada live mode.
+function buildAlertDaily(): TimelinePoint[] {
+  const byDay = new Map<string, TimelinePoint>();
+  for (const t of demoTimeline) {
+    const day = t.ts.slice(0, 10);
+    const cur = byDay.get(day) ?? {
+      ts: day, zeek: 0, suricata: 0, arkime: 0, bytes: 0,
+      alerts_critical: 0, alerts_high: 0, alerts_medium: 0, alerts_low: 0,
+    };
+    cur.alerts_critical += t.alerts_critical;
+    cur.alerts_high += t.alerts_high;
+    cur.alerts_medium += t.alerts_medium;
+    cur.alerts_low += t.alerts_low;
+    byDay.set(day, cur);
+  }
+  return [...byDay.values()];
+}
+export const demoAlertDaily: TimelinePoint[] = buildAlertDaily();
+
 export const demoHeatmap: HeatCell[] = demoTimeline.map((p, i) => ({
   day: 6 - Math.floor(i / 24), hour: i % 24,
   value: p.alerts_critical + p.alerts_high + p.alerts_medium + p.alerts_low,
@@ -843,6 +863,7 @@ export function buildRichOverview(): RichOverview {
     zone_traffic: demoZoneTraffic,
     eps_history: demoEpsHistory,
     mttr: demoMTTR,
+    alert_daily: demoAlertDaily,
     new_alerts_today: demoAlerts.filter((a) => a.status === "new").length,
     critical_open: demoAlerts.filter((a) => a.severity === "critical" && !["closed", "false_positive"].includes(a.status)).length,
     mean_time_to_ack_min: 14,

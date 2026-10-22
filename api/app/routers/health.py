@@ -368,15 +368,31 @@ def stats_overview(user: User = Depends(require_permission("view")),
     out["top_http_hosts"] = _top("ndr-zeek-http-read", "http.host", "key")
     out["top_tls_sni"] = _top("ndr-zeek-tls-read", "tls.sni", "key")
 
-    # alert daily 7d (Reports)
+    # alert daily 7d (Reports) - v0.16.2 (BUG-0161-02): kini dengan split
+    # severity per hari (sub-agg terms severity) sehingga chart stacked
+    # severity Reports menampilkan data NYATA, bukan nol hardcode UI.
     try:
         res = os.aggregate("ndr-alerts-read", {
             "size": 0,
             "query": {"range": {"last_seen": {"gte": week_ago}}},
             "aggs": {"daily": {"date_histogram": {
-                "field": "last_seen", "calendar_interval": "day"}}}})
+                "field": "last_seen", "calendar_interval": "day"},
+                "aggs": {"sev": {"terms": {"field": "severity",
+                                           "size": 4}}}}}})
         out["alert_daily_7d"] = [
-            {"day": b["key_as_string"][:10], "alerts": b["doc_count"]}
+            {"day": b["key_as_string"][:10], "alerts": b["doc_count"],
+             "critical": sum(s["doc_count"] for s in
+                             b.get("sev", {}).get("buckets", [])
+                             if s["key"] == "critical"),
+             "high": sum(s["doc_count"] for s in
+                         b.get("sev", {}).get("buckets", [])
+                         if s["key"] == "high"),
+             "medium": sum(s["doc_count"] for s in
+                           b.get("sev", {}).get("buckets", [])
+                           if s["key"] == "medium"),
+             "low": sum(s["doc_count"] for s in
+                        b.get("sev", {}).get("buckets", [])
+                        if s["key"] == "low")}
             for b in res["aggregations"]["daily"]["buckets"]]
         out["alerts_7d"] = sum(b["doc_count"]
                                for b in res["aggregations"]["daily"]["buckets"])

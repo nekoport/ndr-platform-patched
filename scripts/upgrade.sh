@@ -31,7 +31,34 @@ fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "[upgrade] building new images..."
-docker compose build
+# v0.16.2 (BUG-0161-03): build EKSPLISIT dengan profil sensor. Dulu
+# `docker compose build` polos tidak membangun image zeek/suricata/arkime
+# (profile sensor), sehingga `up -d --force-recreate` di bawah membuat
+# ulang container sensor dengan IMAGE LAMA - "upgrade" sensor fiktif
+# (dikonfirmasi di verifikasi 0.16.1; operator harus build manual).
+# Fallback ke build dasar untuk deployment base-only.
+if docker compose --profile sensor build 2>/dev/null; then
+  echo "[upgrade] build OK (termasuk profil sensor)"
+else
+  echo "[upgrade] profil sensor tidak tersedia - build dasar saja"
+  docker compose build
+fi
+
+# v0.16.2 (BUG-0161-06): rotasi OTOMATIS JWT_SECRET lemah/placeholder.
+# .env buatan installer lama berisi 9 char; guard API 0.16.1 menolaknya
+# lalu tiap worker memakai secret ephemeral berbeda -> 401 acak.
+# Installer baru (v0.16.x) sudah generate otomatis; skrip ini menutup
+# .env lama yang belum dirotasi (backup dibuat sebelum perubahan).
+_jwt=$(grep -E '^JWT_SECRET=' .env 2>/dev/null | cut -d= -f2- || true)
+if [ -z "${_jwt}" ] || [ "${#_jwt}" -lt 32 ] || [ "${_jwt}" = "change-me-32-bytes-min" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    cp .env ".env.bak-jwt-$(date +%Y%m%dT%H%M%S)" 2>/dev/null || true
+    sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .env
+    echo "[upgrade] JWT_SECRET lemah/placeholder dirotasi otomatis (backup .env.bak-jwt-*)"
+  else
+    echo "[upgrade] WARNING: JWT_SECRET lemah tetapi openssl tidak ada - set manual: openssl rand -hex 32"
+  fi
+fi
 
 echo "[upgrade] running idempotent schema init (postgres/init is applied on first boot; changes are handled by API startup create_all)..."
 # SQLAlchemy create_all runs on API start; destructive migrations are manual.
@@ -45,9 +72,14 @@ docker compose up -d --force-recreate ndr-api ndr-ui ndr-pipeline
 echo "[upgrade] recreating sensor layer (image may have changed)..."
 # v0.16.1 (P2-5): sensor TIDAK lagi andal pada perilaku default
 # `up -d` - wajib --force-recreate agar image baru benar-benar dipakai.
-# Efek samping sah: checkpoint log di-reset? TIDAK - pipeline checkpoint
-# v2 (B3) memvalidasi [dev,ino]; inode log Zeek baru menyebabkan file
-# baru dibaca dari EOF (pipeline tetap aman, tidak membanjiri ulang).
+# v0.16.2 (BUG-0161-04, koreksi dokumen): perilaku checkpoint saat inode
+# log berubah ADALAH membaca file baru dari AWAL (offset 0), BUKAN dari
+# EOF seperti klaim catatan lama. Artinya: (1) file log yang benar-benar
+# baru diproses dari awal - benar dan tanpa duplikat berkat dedup; (2)
+# file SAMA yang tumbuh selama downtime (mis. eve.json +297 MB) akan
+# dimainkan ulang dari checkpoint - itu memang desain no-loss; banjir
+# indexing akibatnya kini diredam pacing catch-up + sink cooldown +
+# replay deadletter, bukan diabaikan.
 docker compose --profile sensor up -d --force-recreate zeek suricata arkime 2>/dev/null \
   || docker compose up -d --force-recreate zeek suricata arkime 2>/dev/null \
   || echo "[upgrade] sensor services not present (base-only deployment)"

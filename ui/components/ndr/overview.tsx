@@ -24,7 +24,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LiveTrafficWidget } from "./live-traffic";
 import { DEMO_MODE, demoNewFeedItem, demoTickEps } from "@/lib/ndr/api";
-import type { FeedEvent, RichOverview } from "@/lib/ndr/types";
+import type { FeedEvent, RichOverview, TimelinePoint } from "@/lib/ndr/types";
 import { cn } from "@/lib/utils";
 
 // ----------------------------------------------------------------- KPI card
@@ -168,8 +168,11 @@ export function OverviewView({ rich, loading, onOpenAlerts, loadError, onRetry }
   const alertSpark = useMemo(
     () => (rich?.stats.alert_trend ?? []).map((t) => t.count),
     [rich]);
+  // v0.16.2 (BUG-0161-01): pakai `count` eksak per bucket (seluruh
+  // engine); fallback zeek+suricata bila engines kosong (data lama).
   const eventSpark = useMemo(
-    () => (rich?.timeline.slice(-48) ?? []).map((t) => t.zeek + t.suricata),
+    () => (rich?.timeline.slice(-48) ?? [])
+      .map((t) => t.count ?? t.zeek + t.suricata),
     [rich]);
   const bytesSpark = useMemo(
     () => (rich?.timeline.slice(-48) ?? []).map((t) => Math.round(t.bytes / 1e6)),
@@ -232,10 +235,14 @@ export function OverviewView({ rich, loading, onOpenAlerts, loadError, onRetry }
     .filter((s) => s.count > 0)
     .map((s) => ({ name: s.key, value: s.count, color: SEV_COLORS[s.key] ?? "#71717a" }));
   const radarData = (rich.rule_stats ?? []).map((r) => ({ rule: r.name.split(" (")[0], fired: r.fired_7d }));
+  // v0.16.2 (BUG-0161-01): KPI Events kini menjumlah `count` eksak dari
+  // API (engines nested benar di by_ts) - dulu menjumlah zeek+suricata
+  // yang selalu 0 akibat agregasi engines tidak di-nest.
+  const ptTotal = (t: TimelinePoint) => t.count ?? t.zeek + t.suricata;
   const last24 = rich.timeline.slice(-24);
   const prev24 = rich.timeline.slice(-48, -24);
-  const events24 = last24.reduce((s, t) => s + t.zeek + t.suricata, 0);
-  const eventsPrev = prev24.reduce((s, t) => s + t.zeek + t.suricata, 0);
+  const events24 = last24.reduce((s, t) => s + ptTotal(t), 0);
+  const eventsPrev = prev24.reduce((s, t) => s + ptTotal(t), 0);
   const deltaEvents = eventsPrev ? Math.round(((events24 - eventsPrev) / eventsPrev) * 100) : null;
   const diskUsed = rich.health.disk?.used_pct ?? 0;
   const totalInMbps = rich.zone_traffic.reduce((s, z) => s + z.in_mbps, 0);

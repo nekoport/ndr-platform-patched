@@ -16,12 +16,24 @@ export function ReportsView({ rich }: { rich: RichOverview | null }) {
     return <p className="py-20 text-center text-sm text-zinc-500">Report data unavailable</p>;
   }
 
-  const total7d = rich.timeline.reduce((s, t) => s + t.alerts_critical + t.alerts_high + t.alerts_medium + t.alerts_low, 0);
-  const events7d = rich.timeline.reduce((s, t) => s + t.zeek + t.suricata, 0);
+  // v0.16.2 (BUG-0161-02): KPI Reports kini membaca angka NYATA dari
+  // /api/stats/overview (alerts_7d, events_7d, mttr_hours_avg, closed_7d).
+  // Dulu menjumlah timeline.alerts_* (tidak pernah dikirim backend ->
+  // hardcode 0) dan timeline.zeek+suricata (24h + engines kosong) sehingga
+  // SEMUA kartu Reports menampilkan 0 meski data ada.
+  const total7d = rich.stats.alerts_7d
+    ?? rich.timeline.reduce((s, t) => s + t.alerts_critical + t.alerts_high + t.alerts_medium + t.alerts_low, 0);
+  const events7d = rich.stats.events_7d
+    ?? rich.timeline.reduce((s, t) => s + (t.count ?? t.zeek + t.suricata), 0);
   const closed = rich.stats.alerts_by_status?.find((s) => s.key === "closed")?.count ?? 0;
-  const avgMttr = rich.mttr.length
-    ? rich.mttr.reduce((s, m) => s + m.mttr_hours, 0) / rich.mttr.length : 0;
-  const closedTotal = rich.mttr.reduce((s, m) => s + m.closed, 0);
+  // MTTR: rata-rata tertimbang dari backend; fallback hitung lokal.
+  const avgMttr = rich.stats.mttr_hours_avg
+    ?? (rich.mttr.length
+      ? rich.mttr.reduce((s, m) => s + m.mttr_hours * m.closed, 0)
+        / (rich.mttr.reduce((s, m) => s + m.closed, 0) || 1)
+      : 0);
+  const closedTotal = rich.stats.closed_7d
+    ?? rich.mttr.reduce((s, m) => s + m.closed, 0);
   const topHosts = [...rich.hosts].sort((a, b) => b.risk_score - a.risk_score).slice(0, 8);
   const worstTechnique = (rich.rule_stats ?? []).slice().sort((a, b) => b.fired_7d - a.fired_7d)[0];
   const period = `${new Date(Date.now() - 6 * 864e5).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })} - ${new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}`;
@@ -82,8 +94,8 @@ export function ReportsView({ rich }: { rich: RichOverview | null }) {
 
       {/* charts */}
       <div className="grid gap-4 lg:grid-cols-3">
-        <VizPanel className="lg:col-span-2" title="Detection volume - 7 days" sub="stacked by severity">
-          <SeverityStackedArea data={rich.timeline} height={200} />
+        <VizPanel className="lg:col-span-2" title="Detection volume - 7 days" sub="alerts per day, stacked by severity">
+          <SeverityStackedArea data={rich.alert_daily} height={200} />
         </VizPanel>
         <VizPanel title="Resolution trend" sub="mean hours to resolve, daily">
           <MttrChart data={rich.mttr} height={200} />

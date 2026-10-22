@@ -518,5 +518,5 @@ class TestV0160Wiring:
     def test_version_is_0160(self, client):
         res = client.get("/api/meta")
         assert res.status_code == 200
-        # v0.16.1: kontrak versi mengikuti rilis (bugfix lapangan)
-        assert res.json()["version"] == "0.16.1"
+        # v0.16.2: kontrak versi mengikuti rilis (bugfix lapangan)
+        assert res.json()["version"] == "0.16.2"

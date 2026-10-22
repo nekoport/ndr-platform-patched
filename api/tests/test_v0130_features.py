@@ -64,27 +64,72 @@ def test_client_ip_honours_xff_with_trust_proxy(client, users_seeded):
 
 # --------------------------------------------------------- events timeline
 def test_events_timeline_shape(client, _fake_os, monkeypatch):
-    """GET /api/events/timeline returns REAL histogram points (size 0)."""
+    """GET /api/events/timeline returns REAL histogram points (size 0).
+
+    v0.16.2 (BUG-0161-01): kontrak baru - by_ts utama TANPA agg engine
+    (count eksak di seluruh alias), lalu split `engines` DI-NEST di dalam
+    by_ts per kelompok mapping keyword dan digabung per bucket.
+    """
+    calls = {"n": 0}
+
     def fake_agg(**kw):
+        calls["n"] += 1
+        aggs = kw.get("aggs") or {}
+        bucket_engine = "engines" in (aggs.get("by_ts", {}).get("aggs") or {})
+        buckets = [
+            {"key": 1000, "key_as_string": "2026-10-19T01:00:00Z",
+             "doc_count": 5},
+            {"key": 2000, "key_as_string": "2026-10-19T02:00:00Z",
+             "doc_count": 2},
+        ]
+        if bucket_engine:
+            buckets[0]["engines"] = {"buckets": [
+                {"key": "zeek", "doc_count": 3},
+                {"key": "suricata", "doc_count": 2}]}
+            buckets[1]["engines"] = {"buckets": [
+                {"key": "zeek", "doc_count": 2}]}
         return {"hits": {"total": {"value": 7, "relation": "eq"}},
-                "aggregations": {"by_ts": {"buckets": [
-                    {"key_as_string": "2026-10-19T01:00:00Z",
-                     "doc_count": 5,
-                     "engines": {"buckets": [
-                         {"key": "zeek", "doc_count": 3},
-                         {"key": "suricata", "doc_count": 2}]}},
-                    {"key_as_string": "2026-10-19T02:00:00Z",
-                     "doc_count": 2, "engines": {"buckets": []}},
-                ]}}}
+                "aggregations": {"by_ts": {"buckets": buckets}}}
+
+    def fake_groups(alias, field):
+        return [("source_engine", [])], []
 
     monkeypatch.setattr(_fake_os, "guarded_aggregate", fake_agg)
+    monkeypatch.setattr(_fake_os, "keyword_aggregation_groups", fake_groups)
     _login(client)
     r = client.get("/api/events/timeline?hours=24")
     assert r.status_code == 200
     body = r.json()
+    # pemanggilan pertama = by_ts utama TANPA engines; kedua = nested
+    assert calls["n"] == 2
     assert body["interval"] == "1h" and body["total"] == 7
     assert body["points"][0]["count"] == 5
     assert body["points"][0]["engines"]["zeek"] == 3
+    assert body["points"][0]["engines"]["suricata"] == 2
+    assert body["points"][1]["engines"]["zeek"] == 2
+
+
+def test_events_timeline_survives_engine_split_failure(client, _fake_os, monkeypatch):
+    """v0.16.2: gagal split engine TIDAK menggagalkan timeline utama;
+    kegagalan dilaporkan transparan di `warnings` (no silent partial)."""
+    def fake_agg(**kw):
+        return {"hits": {"total": {"value": 2, "relation": "eq"}},
+                "aggregations": {"by_ts": {"buckets": [
+                    {"key": 1000, "key_as_string": "2026-10-19T01:00:00Z",
+                     "doc_count": 2}]}}}
+
+    def fake_groups_fail(alias, field):
+        return [("source_engine", [])], ["ndr-zeek-dns-2026.10.14"]
+
+    monkeypatch.setattr(_fake_os, "guarded_aggregate", fake_agg)
+    monkeypatch.setattr(_fake_os, "keyword_aggregation_groups", fake_groups_fail)
+    _login(client)
+    r = client.get("/api/events/timeline?hours=24")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+    assert body["points"][0]["engines"] == {}
+    assert any("ndr-zeek-dns-2026.10.14" in w for w in body.get("warnings", []))
 
 
 def test_events_timeline_backend_down_502(client, _fake_os, monkeypatch):

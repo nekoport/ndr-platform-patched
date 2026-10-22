@@ -160,10 +160,13 @@ export async function getRichOverview(): Promise<RichOverview> {
     await new Promise((r) => setTimeout(r, 120));
     return buildRichOverview();
   }
+  // v0.16.2 (BUG-0161-01): timeline diambil 48 JAM (bukan 24) sehingga
+  // perbandingan "vs prev 24h" di Dashboard punya data, dan tiap titik
+  // membawa `count` (total eksak seluruh engine) dari API.
   const [health, stats, timeline] = await Promise.all([
     getHealth(),
     getOverviewStats(),
-    fetchEventsTimeline(24).catch(() => ({ points: [] as {
+    fetchEventsTimeline(48).catch(() => ({ points: [] as {
       ts: string; count: number; engines?: Record<string, number> }[] })),
   ]);
   // v0.16.1 (P1-2): Dashboard/Topology/Assets/Reports kini dibekali data
@@ -185,13 +188,28 @@ export async function getRichOverview(): Promise<RichOverview> {
     stats,
     hosts: richHosts,
     externals: [], flows: [],
+    // v0.16.2 (BUG-0161-01): simpan `count` eksak dari API; zeek/suricata
+    // tetap dipetakan untuk chart split engine.
     timeline: (timeline.points ?? []).map((p) => ({
       ts: p.ts,
+      count: p.count ?? (p.engines?.zeek ?? 0) + (p.engines?.suricata ?? 0),
       zeek: Math.round(p.engines?.zeek ?? 0),
       suricata: Math.round(p.engines?.suricata ?? 0),
       arkime: Math.round(p.engines?.arkime ?? 0),
       bytes: 0,
       alerts_critical: 0, alerts_high: 0, alerts_medium: 0, alerts_low: 0,
+    })),
+    // v0.16.2 (BUG-0161-02): volume deteksi harian 7d + split severity
+    // NYATA dari stats.alert_daily_7d (dulu chart Reports selalu kosong
+    // karena membaca alerts_* hardcode-0 dari timeline events).
+    alert_daily: ((s.alert_daily_7d ?? []) as NonNullable<
+      OverviewStats["alert_daily_7d"]>).map((d) => ({
+      ts: d.day,
+      zeek: 0, suricata: 0, arkime: 0, bytes: 0,
+      alerts_critical: d.critical ?? 0,
+      alerts_high: d.high ?? 0,
+      alerts_medium: d.medium ?? 0,
+      alerts_low: d.low ?? 0,
     })),
     alert_heatmap: [],
     top_internal_talkers: richHosts.slice(0, 8).map((h) => ({

@@ -58,6 +58,36 @@ class Config:
     bulk_max_retries: int = _env_int("PIPELINE_BULK_MAX_RETRIES", 8)
     queue_capacity: int = _env_int("PIPELINE_QUEUE_CAPACITY", 20000)
 
+    # v0.16.2 (BUG-0161-04): backpressure adaptif + retry deadletter.
+    # Riwayat lapangan (verifikasi 0.16.1): restart dengan backlog eve.json
+    # 297 MB diputar sekaligus -> OpenSearch saturasi (CPU ~939%) ->
+    # 4.807 dokumen deadletter `sink_timeout` dan TIDAK PERNAH di-retry.
+    # cooldown: setelah ConnectionTimeout, sink tidur eksponensial sebelum
+    # bulk berikutnya (melindungi OS yang sedang kepanasan) dan memperkecil
+    # batch; berhasil -> cooldown menyusut & batch pulih.
+    sink_cooldown_max_seconds: float = _env_float(
+        "PIPELINE_SINK_COOLDOWN_MAX_SECONDS", 60.0)
+    sink_batch_min_items: int = _env_int("PIPELINE_SINK_BATCH_MIN_ITEMS", 50)
+    # replay: deadletter `sink_timeout`/`sink_failure` dimainkan ulang ke
+    # sink queue secara berkala (doc _id deterministik -> idempoten).
+    # 0 pada PIPELINE_DLQ_REPLAY mematikan (kill switch).
+    dlq_replay_enabled: bool = _env_int("PIPELINE_DLQ_REPLAY", 1) == 1
+    dlq_replay_interval_seconds: int = _env_int(
+        "PIPELINE_DLQ_REPLAY_INTERVAL_SECONDS", 300)
+    dlq_replay_max_age_hours: int = _env_int(
+        "PIPELINE_DLQ_REPLAY_MAX_AGE_HOURS", 24)
+    dlq_replay_max_per_cycle: int = _env_int(
+        "PIPELINE_DLQ_REPLAY_MAX_PER_CYCLE", 2000)
+    dlq_replay_max_attempts: int = _env_int(
+        "PIPELINE_DLQ_REPLAY_MAX_ATTEMPTS", 3)
+    # pacing: saat backlog tailer > ambang (catch-up pasca-restart), prosesor
+    # tidur singkat per N event agar indexing tidak menenggelamkan OpenSearch.
+    # 0 pada PIPELINE_CATCHUP_PACE_THRESHOLD mematikan pacing.
+    catchup_pace_threshold_seconds: float = _env_float(
+        "PIPELINE_CATCHUP_PACE_THRESHOLD_SECONDS", 300.0)
+    catchup_pace_batch: int = _env_int("PIPELINE_CATCHUP_PACE_BATCH", 250)
+    catchup_pace_sleep_ms: int = _env_int("PIPELINE_CATCHUP_PACE_SLEEP_MS", 100)
+
     # state
     state_dir: str = os.environ.get("PIPELINE_STATE_DIR", "/data/state")
     raw_retention_hours: int = _env_int("PIPELINE_RAW_RETENTION_HOURS", 72)

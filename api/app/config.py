@@ -124,27 +124,81 @@ class Config:
 
 def _harden_jwt_secret() -> None:
     """v0.16.1 (P2-3): tolak secret JWT lemah.
+    v0.16.2 (BUG-0161-06): fallback kini PERSISTEN, bukan ephemeral.
 
-    Secret pendek (contoh live: 9 byte) membuat HMAC-SHA256 mudah
-    di-brute-force. Tanpa JWT_SECRET / di bawah 32 char, kita menurunkan
-    secret acak 48-hex EPHEMERAL:
-      * keuntungan  : tidak ada lagi kunci lemah yang bisa dipakai musuh;
-      * konsekuensi : semua sesi hangus setiap API restart;
-      * permanen    : set JWT_SECRET (>= 32 char acak) di .env - contoh
-        generator: `openssl rand -hex 32`.
+    Riwayat lapangan: `.env` hasil installer lama berisi placeholder 9
+    karakter. Guard 0.16.1 menolaknya lalu membuat secret acak 48-hex
+    EPHEMERAL DI MEMORI - tiap worker uvicorn memakai secret BERBEDA,
+    sehingga sesi yang valid di worker A ditolak worker B dengan 401
+    "Invalid session" ACAK (dikonfirmasi di verifikasi 0.16.1).
+
+    Perilaku baru:
+      1. JWT_SECRET >= 32 char  -> dipakai apa adanya (konfigurasi eksplisit
+         tetap menang, tidak ada file yang ditulis).
+      2. Selain itu -> coba baca FILE SECRET PERSISTEN
+         (JWT_SECRET_FILE, default /var/lib/ndr-api/jwt-secret.key).
+         File >= 32 char -> dipakai oleh SEMUA worker & tetap valid
+         lintas restart.
+      3. File tidak ada/terlalu pendek -> generate `secrets.token_hex(24)`,
+         tulis atomik (mode 0600) ke file tsb, lalu dipakai.
+    Dengan ini tidak ada lagi skenario 401 acak antar-worker, dan sesi
+    tidak hangus setiap restart hanya karena .env belum dirotasi.
     """
+    import logging
+    import os as _os
     import secrets as _secrets
 
     secret = (Config.jwt_secret or "").strip()
     if len(secret) >= 32:
         return
-    Config.jwt_secret = _secrets.token_hex(24)
-    import logging
-    logging.getLogger("uvicorn.error").warning(
-        "JWT_SECRET tidak diset atau terlalu pendek (%s char) - memakai "
-        "secret acak EPHEMERAL; semua sesi hangus saat API restart. "
-        "Tetapkan JWT_SECRET permanen (>= 32 char, mis. `openssl rand "
-        "-hex 32`) di .env.", len(secret))
+
+    default_dir = "/var/lib/ndr-api"
+    secret_file = (_os.environ.get("JWT_SECRET_FILE", "").strip()
+                   or _os.path.join(default_dir, "jwt-secret.key"))
+    log = logging.getLogger("uvicorn.error")
+
+    # 2) file persisten yang sudah valid?
+    try:
+        if _os.path.isfile(secret_file):
+            with open(secret_file, "r", encoding="utf-8") as fh:
+                persisted = (fh.read() or "").strip()
+            if len(persisted) >= 32:
+                Config.jwt_secret = persisted
+                log.warning(
+                    "JWT_SECRET di .env tidak diset/terlalu pendek - "
+                    "memakai secret PERSISTEN dari %s (>= 32 char). "
+                    "Disarankan tetap set JWT_SECRET acak di .env "
+                    "(`openssl rand -hex 32`).", secret_file)
+                return
+    except OSError as exc:
+        log.warning("gagal membaca %s: %s", secret_file, exc)
+
+    # 3) generate sekali dan TULIS ke disk agar semua worker memakai
+    #    secret yang sama (akar perbaikan 401 acak).
+    generated = _secrets.token_hex(24)
+    try:
+        _os.makedirs(_os.path.dirname(secret_file), exist_ok=True)
+        tmp = f"{secret_file}.tmp.{_secrets.token_hex(4)}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(generated)
+        _os.chmod(tmp, 0o600)
+        _os.replace(tmp, secret_file)
+        Config.jwt_secret = generated
+        log.warning(
+            "JWT_SECRET tidak diset/terlalu pendek - secret acak baru "
+            "DIGENERASI dan DIPERSISTENKAN di %s (mode 0600). Semua "
+            "worker & restart berikutnya memakai secret yang sama. Untuk "
+            "rotasi manual: set JWT_SECRET (>= 32 char) di .env lalu "
+            "hapus file tsb.", secret_file)
+        return
+    except OSError as exc:
+        # disk read-only dkk: fallback terakhir = ephemeral (perilaku
+        # 0.16.1) dengan peringatan EXPLISIT tentang konsekuensinya.
+        Config.jwt_secret = generated
+        log.error(
+            "gagal menulis secret persisten ke %s (%s) - memakai secret "
+            "EPHEMERAL; sesi hangus saat restart dan multi-worker TIDAK "
+            "konsisten. Set JWT_SECRET di .env segera.", secret_file, exc)
 
 
 _harden_jwt_secret()

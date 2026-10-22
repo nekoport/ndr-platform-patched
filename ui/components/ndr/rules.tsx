@@ -36,13 +36,14 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  createCustomRule, deleteCustomRule, getRulesSummary, listRules,
-  listZeekRules, toggleRule, updateCustomRule, updateRulesNow,
+  createCustomRule, deleteCustomRule, getRulesStatus, getRulesSummary,
+  listRules, listZeekRules, toggleRule, updateCustomRule, updateRulesNow,
   validateRuleText,
 } from "@/lib/ndr/api";
 import { DEMO_MODE } from "@/lib/ndr/api";
 import type {
-  RuleRow, RulesList, RulesSummary, RuleValidateResult, ZeekScriptList,
+  RuleRow, RulesList, RulesStatus, RulesSummary, RuleValidateResult,
+  ZeekScriptList,
 } from "@/lib/ndr/types";
 import { Paginator, StatCard, fmtNumber, fmtTime, timeAgo } from "./shared";
 
@@ -114,6 +115,9 @@ export function RulesView({ canEdit, username }: {
 }) {
   const { toast } = useToast();
   const [summary, setSummary] = useState<RulesSummary | null>(null);
+  // v0.16.1 (P1-3): status ringan (file/socket) TIDAK tergantung parsing
+  // 45 MB - kartu KPI tetap benar meski summary gagal/lambat.
+  const [ruleStatus, setRuleStatus] = useState<RulesStatus | null>(null);
   const [list, setList] = useState<RulesList | null>(null);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
@@ -272,6 +276,15 @@ export function RulesView({ canEdit, username }: {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  // v0.16.1 (P1-3): status endpoint di-fetch TERPISAH dari summary/list.
+  // Dulu satu Promise.all membuat kegagalan mana pun mengosongkan
+  // seluruh Rule Manager ("not found"/"offline" padahal backend hidup).
+  useEffect(() => {
+    let alive = true;
+    getRulesStatus().then((s) => { if (alive) setRuleStatus(s); });
+    return () => { alive = false; };
+  }, []);
+
   const maxHits = useMemo(() =>
     Math.max(1, ...(list?.items ?? []).map((r) => r.hits_7d ?? 0)), [list]);
 
@@ -365,19 +378,40 @@ export function RulesView({ canEdit, username }: {
         </div>
       </Card>
 
-      {/* summary cards */}
+      {/* summary cards - v0.16.1 (P1-3): file/sensor dibaca dari /status
+          (ringan, path persis yang dilihat API); bila belum terbaca,
+          label jujur "memuat/unknown" - BUKAN klaim "not found"/"offline"
+          yang menyesatkan. */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard title="Rules loaded" value={summary ? fmtNumber(summary.total) : "..."}
-                  sub={summary?.rules_file_exists ? `file updated ${timeAgo(summary.rules_file_updated)}` : "suricata.rules not found"} />
+                  sub={
+                    summary?.rules_file_exists
+                      ? `file updated ${timeAgo(summary.rules_file_updated)}`
+                      : ruleStatus
+                        ? (ruleStatus.rules_file_exists
+                            ? `file updated ${timeAgo(ruleStatus.rules_file_updated)}`
+                            : `file tidak ada di API (${ruleStatus.rules_file})`)
+                        : "memuat status file..."
+                  } />
         <StatCard title="Enabled" value={summary ? fmtNumber(summary.enabled) : "..."}
                   sub={summary ? `${Object.entries(summary.actions).map(([k, v]) => `${k}: ${v}`).join(" / ") || "-"}` : undefined}
                   tone="ok" />
         <StatCard title="Disabled" value={summary ? fmtNumber(summary.disabled) : "..."}
                   sub="SIDs in disable.conf"
                   tone={summary && summary.disabled > 0 ? "alert" : "default"} />
-        <StatCard title="Sensor" value={summary?.sensor_online ? "online" : "offline"}
-                  sub={summary?.sensor_online ? "unix command socket present - live reload available" : "no socket - changes apply at next sensor start"}
-                  tone={summary?.sensor_online ? "ok" : "alert"} />
+        <StatCard
+          title="Sensor"
+          value={ruleStatus
+            ? (ruleStatus.sensor_online ? "online" : "offline")
+            : summary
+              ? (summary.sensor_online ? "online" : "offline")
+              : "..."}
+          sub={ruleStatus
+            ? (ruleStatus.socket_present
+                ? `socket ${ruleStatus.unix_socket} - live reload siap`
+                : `socket tidak ada di API (${ruleStatus.unix_socket})`)
+            : "memuat status sensor..."}
+          tone={(ruleStatus?.sensor_online ?? summary?.sensor_online) ? "ok" : (ruleStatus || summary ? "alert" : "default")} />
       </div>
 
       {/* pending reload banner */}
@@ -555,7 +589,12 @@ export function RulesView({ canEdit, username }: {
                 <TableHead className="min-w-[320px]">Message</TableHead>
                 <TableHead className="w-44">Category</TableHead>
                 <TableHead className="w-16">Prio</TableHead>
-                <TableHead className="w-32">Alerts 7d</TableHead>
+                <TableHead className="w-24"
+                           title="v0.16.0 (req 15): hit 24 jam dari tabel rule_stats (refresh 15 menit)">Hits 24h</TableHead>
+                <TableHead className="w-32"
+                           title="v0.16.0 (req 15): hit 7 hari; >1000 = badge noisy">Hits 7d</TableHead>
+                <TableHead className="w-32"
+                           title="v0.16.0 (req 15): hit terakhir + severity maksimum">Last hit</TableHead>
                 <TableHead className="w-40">Changed by</TableHead>
                 {canEdit && <TableHead className="w-16">Edit</TableHead>}
               </TableRow>
@@ -602,7 +641,32 @@ export function RulesView({ canEdit, username }: {
                   <TableCell className="text-xs text-zinc-400">
                     {rule.priority != null ? `${rule.priority} ${PRIORITY_LABEL[rule.priority] ?? ""}` : "-"}
                   </TableCell>
-                  <TableCell><HitsBar hits={rule.hits_7d ?? 0} max={maxHits} /></TableCell>
+                  {/* v0.16.0 (req 14/15): kolom statistik dari rule_stats */}
+                  <TableCell className="text-xs tabular-nums text-zinc-300">
+                    {rule.hits_24h != null ? fmtNumber(rule.hits_24h) : "-"}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1.5">
+                      <HitsBar hits={rule.hits_7d ?? 0} max={maxHits} />
+                      {rule.noisy && (
+                        <Badge className="bg-amber-500/15 text-amber-400
+                                          border-amber-500/30 text-[9px] px-1"
+                               title="hits 7 hari > 1000 - pertimbangkan whitelist/turning">
+                          noisy
+                        </Badge>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-[11px] text-zinc-500">
+                    <div>{rule.last_hit_at ? timeAgo(rule.last_hit_at) : "-"}</div>
+                    {rule.sev_max && (
+                      <span className={`text-[10px] uppercase ${
+                        rule.sev_max === "critical" || rule.sev_max === "high"
+                          ? "text-rose-400" : "text-zinc-600"}`}>
+                        max {rule.sev_max}
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-[11px] text-zinc-500">
                     {rule.changed_by ? (
                       <span className="flex items-center gap-1">
@@ -665,6 +729,11 @@ export function RulesView({ canEdit, username }: {
         )}
         {list && list.items.length < list.total && (
           <span>showing {list.items.length} of {list.total} matching rules (page {page})</span>
+        )}
+        {list && (
+          <span title="v0.16.0: statistik hit dari tabel rule_stats di Postgres, di-refresh otomatis (RULE_STATS_REFRESH_MIN)">
+            rule stats: {list.stats_available ? "aktif (rule_stats)" : "menunggu refresh pertama - hit 7d on-the-fly"}
+          </span>
         )}
         {sourceTab === "zeek" && zeek && (
           <span>zeek policy: {zeek.items.length} directive line(s) inventoried (read-only)</span>

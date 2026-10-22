@@ -18,7 +18,6 @@ set -euo pipefail
 IFACE="${CAPTURE_IFACE:?CAPTURE_IFACE is required}"
 ES_URL="${OPENSEARCH_URL:?OPENSEARCH_URL is required}"
 SECRET="${ARKIME_PASSWORD_SECRET:?ARKIME_PASSWORD_SECRET is required}"
-PROXYSECRET="${ARKIME_PROXY_SECRET:?ARKIME_PROXY_SECRET is required}"
 ADMINPW="${ARKIME_ADMIN_PASSWORD:?ARKIME_ADMIN_PASSWORD is required}"
 FREEG="${ARKIME_FREESPACE_G:-40}"
 VPORT="${ARKIME_WEB_PORT:-8005}"
@@ -44,13 +43,42 @@ if [ -n "${NODE_BIN}" ] && [ -d "${NODE_BIN}" ]; then
 fi
 
 # --- render config ------------------------------------------------
+# v0.16.0 (req 13, BAKED): SSO header-auth + webBasePath.
+#   * WEB_BASE_PATH = base publik viewer di browser, TRAILING SLASH
+#     WAJIB (gotcha #1: tanpa slash asset viewer 404 -> putih kosong).
+#   * bila ARKIME_PROXY_SECRET di-set, viewer menerima identitas dari
+#     proxy NDR via header (userNameHeader/requiredAuthHeader +
+#     userAutoCreateTmpl) - user NDR = user viewer tanpa login kedua.
+#     Tanpa secret: form auth tetap (deployment tanpa SSO tetap hidup).
+WEB_BASE="${ARKIME_PUBLIC_BASE:-/backend/api/arkime}"
+WEB_BASE="${WEB_BASE%/}/"
+HEADER_AUTH_BLOCK=""
+if [ -n "${ARKIME_PROXY_SECRET:-}" ]; then
+  AUTO_CREATE='{ "userId": "%U", "userName": "%U", "createDate": 0, '\
+'"lastUsed": 0, "enabled": true, "webEnabled": true, '\
+'"headerAuthEnabled": true, "emailSearch": true, "removeEnabled": false, '\
+'"packetSearch": true, "hidePcap": false, "disablePcapDownload": false, '\
+'"roles": [ "arkimeUser", "arkimeViewer" ] }'
+  HEADER_AUTH_BLOCK="userNameHeader=x-ndr-user
+requiredAuthHeader=x-ndr-secret
+requiredAuthHeaderVal=${ARKIME_PROXY_SECRET}
+userAutoCreateTmpl=${AUTO_CREATE}"
+  echo "[ndr-arkime] SSO header-auth ENABLED (webBasePath=${WEB_BASE})"
+else
+  echo "[ndr-arkime] ARKIME_PROXY_SECRET kosong - SSO off, viewer form-auth"
+fi
+
 sed -e "s|@OPENSEARCH_URL@|${ES_URL}|g" \
     -e "s|@CAPTURE_IFACE@|${IFACE}|g" \
     -e "s|@PASSWORD_SECRET@|${SECRET}|g" \
     -e "s|@FREESPACE_G@|${FREEG}|g" \
-     -e "s|@VIEW_PORT@|${VPORT}|g" \
-     -e "s|@PROXY_SECRET@|${PROXYSECRET}|g" \
-     /opt/arkime/etc/config.ini.template > /opt/arkime/etc/config.ini
+    -e "s|@VIEW_PORT@|${VPORT}|g" \
+    -e "s|@WEB_BASE_PATH@|${WEB_BASE}|g" \
+    /opt/arkime/etc/config.ini.template > /opt/arkime/etc/config.ini
+# placeholder @HEADER_AUTH_BLOCK@ ditulis baris-per-baris (bisa multiline);
+# node dipakai karena terjamin ada (runtime viewer), python tidak.
+# (PATH sudah berisi NODE_BIN dari blok deteksi versi di atas.)
+node -e 'const fs=require("fs");const p="/opt/arkime/etc/config.ini";let t=fs.readFileSync(p,"utf8");t=t.split("@HEADER_AUTH_BLOCK@").join(process.argv[1]||"");fs.writeFileSync(p,t);' "${HEADER_AUTH_BLOCK}"
 
 ip link set "${IFACE}" up || true
 ip link set "${IFACE}" promisc on || true

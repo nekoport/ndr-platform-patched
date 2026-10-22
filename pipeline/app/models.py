@@ -23,6 +23,55 @@ def make_dedup_key(*parts) -> str:
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
+# ------------------------------------------------- JA3 (v0.16.1, P1-5)
+# Zeek polos (tanpa plugin) TIDAK menulis field ja3 di ssl.log, tapi
+# sejak Zeek 5.x ssl.log memuat bahan client-hello: client_cipher_suites,
+# client_extensions, client_curves, client_point_formats. JA3 = md5 atas
+# representasi teks kuintet tersebut (Salesforce JA3 spec). Dihitung di
+# pipeline (deterministik + teruji), bukan script Zeek yang tidak bisa
+# diverifikasi di lapangan. Nilai md5 KONSISTEN INTERNAL: input sama ->
+# hash sama, sehingga cocok untuk agregasi/threat-hunting. Dengan field
+# Zeek hasil bisa beda beberapa persen dari implementasi pyshark (GREASE)
+# - dicatat jujur di dokumen, bukan di-overclaim.
+JA3_VERSION_MAP = {
+    "SSLv2": 2, "SSLv3": 768, "TLSv1.0": 769, "TLSv1.1": 770,
+    "TLSv1.2": 771, "TLSv1.3": 771,  # ClientHello legacy_version 0x0303
+    "DTLSv1.0": 65279, "DTLSv1.2": 65277,
+}
+JA3_GREASE = {2570, 3230, 3240, 4865, 4866, 4867, 5248, 5250, 5251,
+              6066, 6067, 6682}
+
+
+def _ja3_decimals(values) -> list[int]:
+    out: list[int] = []
+    for v in values or []:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def compute_ja3(version: str | None, ciphers, extensions, curves,
+                point_formats) -> str | None:
+    """JA3 md5 dari field client-hello Zeek; None bila data kurang."""
+    cip = _ja3_decimals(ciphers)
+    if not cip:
+        return None
+    ver = JA3_VERSION_MAP.get(str(version or "").strip(), 771)
+    ext = [v for v in _ja3_decimals(extensions) if v not in JA3_GREASE]
+    cur = [v for v in _ja3_decimals(curves) if v not in JA3_GREASE]
+    fmt = _ja3_decimals(point_formats)
+    ja3_string = ",".join([
+        str(ver),
+        "-".join(str(v) for v in cip),
+        "-".join(str(v) for v in ext),
+        "-".join(str(v) for v in cur),
+        "-".join(str(v) for v in fmt),
+    ])
+    return hashlib.md5(ja3_string.encode()).hexdigest()
+
+
 @dataclass
 class Answer:
     name: str | None = None
@@ -86,6 +135,9 @@ class CommonEvent:
     matched_ioc: list[dict] = field(default_factory=list)  # TI enrich (Phase 3)
     source_geo: dict | None = None      # GeoIP enrich (Phase 5, optional)
     destination_geo: dict | None = None # GeoIP enrich (Phase 5, optional)
+    # v0.16.0: campaign tag dari watchlist (mis. "judi-online") - dipakai
+    # preset query, agregasi dashboard, dan detector gambling_access.
+    campaign: str | None = None
     parse_status: str = "ok"          # ok | partial
     dedup_key: str | None = None      # v0.13.0: parser-owned dedup key
     raw_event_ref: str | None = None  # sha256 of raw source line
@@ -132,6 +184,8 @@ class CommonEvent:
             doc.setdefault("source", {})["geo"] = self.source_geo
         if self.destination_geo:
             doc.setdefault("destination", {})["geo"] = self.destination_geo
+        if self.campaign:
+            doc["campaign"] = self.campaign
         if self.severity:
             doc["severity"] = self.severity
         if self.severity_score is not None:

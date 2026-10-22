@@ -84,6 +84,12 @@ class FakeOS(OSClient):
         self.validate_alias(alias)
         return 0
 
+    def exact_total(self, alias, query=None):
+        # v0.16.1 (P1-4/P2-4): total eksak via agg filter match_all;
+        # stub default 0, test spesifik meng-override.
+        self.validate_alias(alias)
+        return 0
+
     def update(self, **kw):
         return {}
 

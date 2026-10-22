@@ -41,14 +41,10 @@ def _safe(value: str | None) -> str | None:
 
 def probe(timeout: float = 2.0) -> dict:
     """Probe the Arkime viewer. Never raises; status is honest."""
-    # Probe under the viewer's webBasePath; ARKIME_PUBLIC_BASE is a
-    # site-relative URL for browser links and cannot be fetched directly.
     base = config.arkime_viewer_url.rstrip("/")
-    prefix = (config.arkime_public_base or "/api/arkime").rstrip("/")
-    target = f"{base}{prefix}/"
     t0 = time.monotonic()
     try:
-        r = httpx.get(target, timeout=timeout, follow_redirects=False)
+        r = httpx.get(base, timeout=timeout, follow_redirects=False)
         latency = int((time.monotonic() - t0) * 1000)
         # Arkime answers 200 (UI) or 302 (auth redirect) when alive
         reachable = r.status_code < 500
@@ -69,8 +65,9 @@ def build_expression(ips: list[str], domains: list[str],
     result ORs the entity conditions - Arkime applies it to the session
     list. Returns "" when nothing usable remains.
 
-    v5.6 note: ip fields reject quoted values ("not a valid ip") - IPs
-    and ports are emitted unquoted; string fields (host) stay quoted.
+    v0.16.0 (quirk Arkime 5.6.2, fix live §27c-4): nilai IP dan PORT
+    TIDAK boleh diberi tanda kutip ('ip == "10.0.0.1"' -> "not a valid
+    ip"); field string (host) tetap di-quote.
     """
     conds: list[str] = []
     for ip in ips or []:
@@ -84,22 +81,31 @@ def build_expression(ips: list[str], domains: list[str],
     for p in ports or []:
         v = _safe(str(p))
         if v and v.isdigit():
-            conds.append(f'port == {v}')
+            conds.append(f"port == {v}")
     # group into ORs; Arkime accepts parentheses around alternatives
     return " || ".join(conds)
 
 
 def session_viewer_url(expression: str, t_from_epoch: int,
                        t_to_epoch: int) -> str:
-    """Deep link into the Arkime session list for the expression+window."""
-    base = (config.arkime_public_base or config.arkime_viewer_url).rstrip("/")
+    """Deep link into the Arkime session list for the expression+window.
+
+    v0.16.0: URL mengarah ke PUBLIC BASE (site-relative melalui proxy
+    API, mis. /backend/api/arkime/sessions) - fallback internal viewer
+    bila ARKIME_PUBLIC_BASE tidak diset.
+    """
+    base = (config.arkime_public_base
+            or config.arkime_viewer_url).rstrip("/")
     return (f"{base}/sessions"
             f"?expression={quote(expression, safe='')}"
             f"&startTime={t_from_epoch}&stopTime={t_to_epoch}")
 
 
 def viewer_base_url() -> str:
-    return (config.arkime_public_base or config.arkime_viewer_url).rstrip("/")
+    """Public viewer base (site-relative) untuk deep-link dari browser.
+    Fallback: URL internal viewer (perilaku lama) bila public base kosong."""
+    return ((config.arkime_public_base
+             or config.arkime_viewer_url).rstrip("/"))
 
 
 def epoch_of(iso_ts: str | None, fallback_epoch: int) -> int:

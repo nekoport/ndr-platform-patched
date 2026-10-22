@@ -500,3 +500,30 @@ class CustomRule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
                                                  default=utcnow,
                                                  onupdate=utcnow)
+
+
+class RuleStat(Base):
+    """Hit statistics per rule (v0.16.0 - requirements 14 + 15).
+
+    rule_key semantics:
+      * source='suricata' -> rule_key is the numeric SID (string form)
+      * source='zeek'     -> rule_key is a zeek_* alert type (script)
+      * source='pipeline' -> rule_key is a behaviour alert_type
+    Refreshed by app.rule_stats.RuleStatsRefresher (15 min default);
+    the Rules Manager joins this table for the Hits 24h/7d columns.
+    """
+    __tablename__ = "rule_stats"
+
+    rule_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source: Mapped[str] = mapped_column(String(16), default="suricata")
+    signature: Mapped[str | None] = mapped_column(String(512), default=None)
+    hits_24h: Mapped[int] = mapped_column(BigInteger, default=0)
+    hits_7d: Mapped[int] = mapped_column(BigInteger, default=0)
+    sev_max: Mapped[str | None] = mapped_column(String(16), default=None)
+    last_hit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None)
+    sample_alert_id: Mapped[str | None] = mapped_column(String(64),
+                                                        default=None)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 default=utcnow,
+                                                 onupdate=utcnow)

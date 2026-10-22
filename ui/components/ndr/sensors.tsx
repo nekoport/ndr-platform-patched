@@ -103,8 +103,11 @@ export function SensorsView({ sensors, rich, loading }: {
       </div>
 
       {/* capture stack components */}
-      <VizPanel title="Capture stack components" icon={<Activity className="h-4 w-4 text-emerald-400" />}
-                sub="per-process resource usage on the sensor host">
+      {/* v0.16.1 (P2-1): kini diisi metrik pipeline NYATA dari health doc
+          (tailer/ingest/normalize/detection/sink/correlation) - bukan CPU%
+          proses sensor yang tidak dapat diamati lintas container. */}
+      <VizPanel title="Component pipeline" icon={<Activity className="h-4 w-4 text-emerald-400" />}
+                sub="metrik per komponen dari health doc pipeline (bukan cpu sensor - gunakan docker stats di host)">
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-4">
           {sensorServices.map((sv) => (
             <div key={sv.name} className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-3">
@@ -112,15 +115,22 @@ export function SensorsView({ sensors, rich, loading }: {
                 <span className="text-xs font-medium text-zinc-200">{sv.name}</span>
                 <span className={cn("h-2 w-2 rounded-full", sv.ok ? "bg-emerald-400" : "bg-red-400")} />
               </div>
-              <p className="mt-0.5 truncate text-[10px] text-zinc-500">{sv.detail}</p>
-              <div className="mt-2">
-                <Sparkline data={sv.cpu_history} color={sv.cpu_pct > 70 ? "#fbbf24" : "#38bdf8"} height={26} />
-              </div>
-              <div className="mt-1.5 flex justify-between text-[10px] tabular-nums text-zinc-500">
-                <span>cpu {sv.cpu_pct}%</span>
-                <span>mem {sv.mem_pct}%</span>
-                <span>up {sv.uptime_days}d</span>
-              </div>
+              <p className="mt-0.5 break-words text-[10px] leading-relaxed text-zinc-500">{sv.detail}</p>
+              {/* bila tidak ada data resource (0/0/0), baris cpu/mem/up disembunyikan - jujur */}
+              {(sv.cpu_pct > 0 || sv.mem_pct > 0 || sv.uptime_days > 0) && (
+                <>
+                  {sv.cpu_history?.length > 1 && (
+                    <div className="mt-2">
+                      <Sparkline data={sv.cpu_history} color={sv.cpu_pct > 70 ? "#fbbf24" : "#38bdf8"} height={26} />
+                    </div>
+                  )}
+                  <div className="mt-1.5 flex justify-between text-[10px] tabular-nums text-zinc-500">
+                    <span>cpu {sv.cpu_pct}%</span>
+                    <span>mem {sv.mem_pct}%</span>
+                    <span>up {sv.uptime_days}d</span>
+                  </div>
+                </>
+              )}
             </div>
           ))}
           {!sensorServices.length && (

@@ -12,7 +12,7 @@ Design refs: NDR System Design & Implementation Plan v1.0
   * section 8.7 (DGA heuristics - baseline NXDOMAIN burst rule)
 """
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 # v0.14.0: selaras dgn models.py (single value; dulu 0.6.0 membuat log
 # startup & health doc menampilkan parser version beda dari event docs)
 PARSER_VERSION = "ndr-pipeline/0.7.0"

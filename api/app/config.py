@@ -15,7 +15,12 @@ class Config:
         "DATABASE_URL",
         "postgresql+psycopg://ndr:ndr@localhost:5432/ndr")
     opensearch_url: str = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
-    jwt_secret: str = os.environ.get("JWT_SECRET", "dev-secret-change-me")
+    # v0.16.1 (P2-3): secret JWT lemah (mis. 9 byte) membuat HMAC mudah
+    # di-brute-force. Bila JWT_SECRET tidak diset / lebih pendek 32 char,
+    # config MENOLAK default lemah dan menurunkan secret acak ephemeral
+    # (48 hex) + WARNING keras - sesi hangus saat API restart sampai
+    # operator menetapkan JWT_SECRET permanen (lihat .env.example).
+    jwt_secret: str = os.environ.get("JWT_SECRET", "")
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = _int("ACCESS_TOKEN_MINUTES", 30)
     admin_username: str = os.environ.get("ADMIN_USERNAME", "admin")
@@ -81,12 +86,32 @@ class Config:
     pcap_file_span_minutes: int = _int("PCAP_FILE_SPAN_MINUTES", 15)
     arkime_viewer_url: str = os.environ.get("ARKIME_VIEWER_URL",
                                             "http://127.0.0.1:8005")
-    # SSO proxy base (NDR custom): when set, Arkime deep links point at
-    # the API proxy prefix instead of the viewer host.
-    arkime_public_base: str = os.environ.get("ARKIME_PUBLIC_BASE",
-                                             "").rstrip("/")
-    arkime_proxy_secret: str = os.environ.get("ARKIME_PROXY_SECRET", "")
     evidence_session_limit: int = _int("EVIDENCE_SESSION_LIMIT", 200)
+
+    # -------------------------------------------------- v0.16.0
+    # export alert (req 6): batas baris per permintaan (guard memori)
+    export_max_rows: int = _int("EXPORT_MAX_ROWS", 50000)
+    # watchlist judi online (req 18): daftar keyword utk DISPLAY di UI
+    # (matcher aslinya di pipeline; sinkronkan env di kedua layanan)
+    gambling_keywords: list = [k.strip().lower() for k in
+                               os.environ.get("GAMBLING_KEYWORDS", "").split(",")
+                               if k.strip()]
+
+    # SSO Arkime (req 13) - kini BAKED, bukan lagi patch VM.
+    # arkime_public_base: base path publik yang dilihat browser untuk
+    # asset/deep-link viewer melalui proxy API (default sama dengan
+    # mount proxy di main.py). arkime_proxy_secret: shared secret antara
+    # API dan viewer (header x-ndr-secret) - WAJIB sama dengan env
+    # ARKIME_PROXY_SECRET di layanan arkime.
+    arkime_public_base: str = os.environ.get(
+        "ARKIME_PUBLIC_BASE", "/backend/api/arkime")
+    arkime_proxy_secret: str = os.environ.get(
+        "ARKIME_PROXY_SECRET", "") or os.environ.get(
+        "ARKIME_VIEWER_SECRET", "")
+
+    # rule stats (req 14/15): interval refresh background (menit).
+    # 0 = matikan refresher (endpoint stats masih bisa agregasi on-the-fly).
+    rule_stats_refresh_minutes: int = _int("RULE_STATS_REFRESH_MIN", 15)
 
     # TLS hardening (v0.12). Set TLS_ENABLED=1 when the API is served
     # over HTTPS - either directly (uvicorn --ssl-certfile/--ssl-keyfile)
@@ -97,4 +122,30 @@ class Config:
     tls_enabled: bool = os.environ.get("TLS_ENABLED", "0") == "1"
 
 
+def _harden_jwt_secret() -> None:
+    """v0.16.1 (P2-3): tolak secret JWT lemah.
+
+    Secret pendek (contoh live: 9 byte) membuat HMAC-SHA256 mudah
+    di-brute-force. Tanpa JWT_SECRET / di bawah 32 char, kita menurunkan
+    secret acak 48-hex EPHEMERAL:
+      * keuntungan  : tidak ada lagi kunci lemah yang bisa dipakai musuh;
+      * konsekuensi : semua sesi hangus setiap API restart;
+      * permanen    : set JWT_SECRET (>= 32 char acak) di .env - contoh
+        generator: `openssl rand -hex 32`.
+    """
+    import secrets as _secrets
+
+    secret = (Config.jwt_secret or "").strip()
+    if len(secret) >= 32:
+        return
+    Config.jwt_secret = _secrets.token_hex(24)
+    import logging
+    logging.getLogger("uvicorn.error").warning(
+        "JWT_SECRET tidak diset atau terlalu pendek (%s char) - memakai "
+        "secret acak EPHEMERAL; semua sesi hangus saat API restart. "
+        "Tetapkan JWT_SECRET permanen (>= 32 char, mis. `openssl rand "
+        "-hex 32`) di .env.", len(secret))
+
+
+_harden_jwt_secret()
 config = Config()

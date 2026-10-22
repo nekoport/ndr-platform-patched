@@ -41,7 +41,11 @@ const SAMPLES: { label: string; mode: "simple" | "advanced"; value: string }[] =
   { label: "DGA-like domains", mode: "simple", value: "example-dga" },
   { label: "C2 destination", mode: "simple", value: "91.245.77.10" },
   { label: "TLS to C2 host", mode: "advanced", value: `{\n  "bool": {\n    "filter": [\n      { "match_phrase": { "tls.sni": "91-245-77-10" } }\n    ]\n  }\n}` },
-  { label: "All DNS events", mode: "simple", value: "dns" },
+  // v0.16.1 (P0-5): preset dulu kirim teks "dns" sebagai term ke field ip
+  // -> parsing gagal, SELALU 0 hasil. Kini preset = filter event_type
+  // eksplisit (benar target + murah, tanpa wildcard lintas 30jt+ dok).
+  { label: "All DNS events", mode: "advanced",
+    value: JSON.stringify({ bool: { filter: [{ term: { event_type: "dns" } }] } }, null, 2) },
 ];
 
 const histConfig = {
@@ -68,13 +72,13 @@ export function EventsView({ canSearch, focus }: {
   const [dsl, setDsl] = useState(DEFAULT_DSL);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
-  const [result, setResult] = useState<{ total: number; hits: EventDoc[]; error?: string } | null>(null);
+  const [result, setResult] = useState<{ total: number; hits: EventDoc[]; error?: string; relation?: string } | null>(null);
   const [expanded, setExpanded] = useState<EventDoc | null>(null);
   const [facet, setFacet] = useState<{ field: string; value: string } | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
 
-  async function run(overrides?: { mode?: "simple" | "advanced"; query?: string; time_from?: string; time_to?: string }) {
+  async function run(overrides?: { mode?: "simple" | "advanced"; query?: string; time_from?: string; time_to?: string; exact_total?: boolean }) {
     if (!canSearch) {
       toast({ title: "Permission denied", description: "Your role cannot run searches.", variant: "destructive" });
       return;
@@ -91,6 +95,7 @@ export function EventsView({ canSearch, focus }: {
         // (2026-10-05) silently hid ALL events once real time passed it
         time_from: overrides?.time_from ?? defaultWindowFrom(),
         time_to: overrides?.time_to,
+        exact_total: overrides?.exact_total ?? false,
       });
       setResult(res);
       setSearched(true);
@@ -353,8 +358,20 @@ export function EventsView({ canSearch, focus }: {
                 <div className="flex flex-wrap items-center gap-2">
                   <CardTitle className="text-sm font-medium text-zinc-300">Results</CardTitle>
                   <Badge variant="outline" className="border-zinc-700 text-zinc-400">
-                    {result.error ? "rejected" : `${fmtNumber(hits.length)} shown / ${fmtNumber(result.total)} hits`}
+                    {result.error ? "rejected"
+                      // v0.16.1 (P2-4): total ter-cap 10.000 dulu tampil
+                      // apa adanya (menyesatkan). Kini ada penanda >= dan
+                      // tombol hitung total persis.
+                      : result.relation === "gte"
+                        ? `${fmtNumber(hits.length)} shown / >= ${fmtNumber(result.total)} hits`
+                        : `${fmtNumber(hits.length)} shown / ${fmtNumber(result.total)} hits`}
                   </Badge>
+                  {!result.error && result.relation === "gte" && (
+                    <button onClick={() => void run({ exact_total: true })}
+                            className="inline-flex items-center gap-1 rounded-full border border-sky-800 bg-sky-950/40 px-2.5 py-0.5 text-[11px] text-sky-300 hover:border-sky-600">
+                      Hitung total persis
+                    </button>
+                  )}
                   {facet && (
                     <button onClick={() => setFacet(null)}
                             className="inline-flex items-center gap-1 rounded-full border border-emerald-800 bg-emerald-950/50 px-2.5 py-0.5 text-[11px] text-emerald-300">

@@ -28,8 +28,8 @@ import {
   JsonViewer, timeAgo,
 } from "./shared";
 import {
-  ChevronRight, FileText, Info, Loader2, Search, ShieldAlert, Waypoints, Zap,
-  ShieldCheck,
+  Cable, ChevronRight, ExternalLink, FileText, Info, Loader2, Search,
+  ShieldAlert, Waypoints, Zap, ShieldCheck,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
@@ -48,6 +48,42 @@ export interface VerifyEventRequest {
   dst?: string;
   from: string;
   to: string;
+}
+
+// v0.16.0 (req 3): badge status kosakata tender (attack_successful/
+// attempt/failure/indeterminate) - beda nuansa dari outcome lama.
+const ATTACK_STATUS_STYLE: Record<string, { label: string; cls: string }> = {
+  attack_successful: { label: "Attack Successful", cls: "border-rose-700 text-rose-300" },
+  attempt: { label: "Attempt", cls: "border-amber-700 text-amber-300" },
+  failure: { label: "Failure", cls: "border-zinc-600 text-zinc-400" },
+  compromise: { label: "Compromise", cls: "border-red-700 text-red-300" },
+  indeterminate: { label: "Indeterminate", cls: "border-zinc-700 text-zinc-400" },
+};
+
+export function AttackStatusBadge({ status }: { status: string }) {
+  const st = ATTACK_STATUS_STYLE[status] ?? ATTACK_STATUS_STYLE.indeterminate;
+  return (
+    <Badge variant="outline" className={`text-[10px] ${st.cls}`}
+           title="Status keberhasilan serangan (kosakata tender, req 3)">
+      {st.label}
+    </Badge>
+  );
+}
+
+// v0.16.0 (req 13): deep-link Arkime SSO untuk alert ini. Ekspresi
+// mengikuti quirk viewer 5.6.2: IP/port TANPA kutip, host di-kutip
+// (sama dengan app.arkime.build_expression di backend).
+function arkimeSessionUrl(a: AlertDoc): string | null {
+  const ip = a.source?.ip || a.destination?.ip;
+  if (!ip) return null;
+  const dst = a.destination?.ip;
+  const parts = [`ip == ${ip}`];
+  if (dst && dst !== ip) parts.push(`ip == ${dst}`);
+  const start = Math.floor(new Date(a.first_seen).getTime() / 1000) - 60;
+  const stop = Math.floor(new Date(a.last_seen).getTime() / 1000) + 60;
+  const expr = encodeURIComponent(parts.join(" || "));
+  return `/backend/api/arkime/sessions?expression=${expr}`
+    + `&startTime=${start}&stopTime=${stop}`;
 }
 
 export function AlertDetailSheet({ alert, canEdit, onClose, onAlertChanged, onOpenThreatMap, onOpenIncident, onVerifyEvents, onEscalate, canApproveWhitelist }: {
@@ -173,6 +209,33 @@ export function AlertDetailSheet({ alert, canEdit, onClose, onAlertChanged, onOp
                     kill chain: {typeof selected.kill_chain === "string" ? selected.kill_chain : "n/a"}
                   </Badge>
                 )}
+                {/* v0.16.0 (req 3/8/18/10): status kosakata tender, skor DGA,
+                    campaign watchlist, CVE dari nama signature */}
+                {(selected as AlertDoc).attack_status && (
+                  <AttackStatusBadge status={(selected as AlertDoc).attack_status!} />
+                )}
+                {(selected as AlertDoc).dga_score != null && (
+                  <Badge variant="outline"
+                         className="border-amber-900 text-[10px] text-amber-300"
+                         title="Skor DGA ternormalisasi 0-100 dari mean entropy domain (req 8)">
+                    DGA score: {Math.round((selected as AlertDoc).dga_score!)}
+                  </Badge>
+                )}
+                {(selected as AlertDoc).campaign && (
+                  <Badge className="bg-rose-500/15 text-[10px] text-rose-300
+                                    border border-rose-500/30"
+                         title="Ditandai watchlist kebijakan (req 18)">
+                    {(selected as AlertDoc).campaign}
+                  </Badge>
+                )}
+                {((selected as AlertDoc).cve ?? []).map((c) => (
+                  <Badge key={c} variant="outline"
+                         className="border-orange-900 text-[10px]
+                                    text-orange-300 font-mono"
+                         title="CVE diekstrak dari nama signature/reason (req 10)">
+                    {c}
+                  </Badge>
+                ))}
               </div>
               <SheetTitle className="text-left text-lg leading-snug text-zinc-100">{alertTitle(selected.title)}</SheetTitle>
               <p className="text-xs text-zinc-500">
@@ -401,11 +464,74 @@ export function AlertDetailSheet({ alert, canEdit, onClose, onAlertChanged, onOp
               <Separator className="bg-zinc-800" />
 
               {/* PCAP & evidence workflow (doc section 15) */}
+              {/* v0.16.0 (req 13): tombol Arkime SSO - original log dari
+                  sensor untuk alert ini, tanpa login kedua (header-auth) */}
+              {(() => {
+                const arkimeUrl = arkimeSessionUrl(selected);
+                return arkimeUrl && (
+                <a
+                  href={arkimeUrl}
+                  target="_blank" rel="noreferrer"
+                  className="flex items-center gap-2 rounded-lg border
+                             border-sky-800 bg-sky-950/40 px-3 py-2 text-xs
+                             text-sky-300 hover:bg-sky-900/40">
+                  <Cable className="h-3.5 w-3.5" />
+                  Buka sesi asli di Arkime Viewer (SSO - req 13)
+                  <ExternalLink className="ml-auto h-3 w-3" />
+                </a>
+                );
+              })()}
+
               <Section title="PCAP & evidence (doc 15)">
                 <EvidencePanel scope="alert" scopeId={selected.alert_id}
                                canExport={canEdit}
                                evidence={selected.evidence} />
               </Section>
+
+              {/* v0.16.0: penjelasan + geo/ASN (req 10/12) */}
+              {(selected.explanation
+                || selected.geo_src || selected.geo_dst) && (
+                <Section title="Konteks otomatis (v0.16)">
+                  {selected.explanation && (
+                    <p className="rounded-lg border border-zinc-800
+                                  bg-zinc-900/60 p-3 text-xs
+                                  leading-relaxed text-zinc-300">
+                      {selected.explanation}
+                    </p>
+                  )}
+                  {(selected.geo_src || selected.geo_dst) && (
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+                      {([["Sumber", selected.geo_src],
+                         ["Tujuan", selected.geo_dst]] as const).map(
+                        ([label, g]) => (
+                          <div key={label} className="rounded-lg border
+                                                      border-zinc-800
+                                                      bg-zinc-900/60 p-2">
+                            <div className="text-[10px] uppercase
+                                            tracking-wide text-zinc-500">
+                              Geo {label} (req 12)
+                            </div>
+                            {g
+                              ? <>
+                                  <div className="text-zinc-200">
+                                    {g.country ?? "-"}
+                                    {g.country_iso_code
+                                      ? ` (${g.country_iso_code})` : ""}
+                                  </div>
+                                  <div className="text-zinc-500 font-mono
+                                                  text-[10px]">
+                                    {g.asn_org ?? ""}
+                                  </div>
+                                </>
+                              : <div className="text-zinc-600">
+                                  privat / tidak terpetakan
+                                </div>}
+                          </div>
+                        ))}
+                    </div>
+                  )}
+                </Section>
+              )}
 
               {canEdit && (
                 <>

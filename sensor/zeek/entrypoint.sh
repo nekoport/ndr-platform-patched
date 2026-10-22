@@ -38,14 +38,30 @@ ethtool -K "${IFACE}" gro off lro off 2>/dev/null || true
 echo "[ndr-zeek] deploying zeekctl..."
 zeekctl deploy
 
-# zeekctl writes an ABSOLUTE `current` symlink (dangles when read from
-# the host bind mount or the pipeline's ro mount) - replace it with a
-# RELATIVE one:  logs/current -> spool/zeek/current  (node name: zeek).
-ln -sfn "spool/zeek/current" "$LOGDIR/current"
+# v0.16.1 (P0-2): zeekctl menulis log live ke $SPOOL/<node>/ yaitu
+# spool/zeek/ (LANGSUNG, tanpa subdir 'current'). Symlink lama
+# "spool/zeek/current" SELALU dangling sehingga pipeline tidak pernah
+# membaca satu pun log Zeek (DNS/conn/TLS/HTTP buta total). Target yang
+# benar adalah direktori node itu sendiri, relatif terhadap $LOGDIR:
+#   zeek container : /usr/local/zeek/logs/current -> spool/zeek
+#   host bind      : <NDR_DATA_ROOT>/zeek/logs/current -> spool/zeek
+#   pipeline (ro)  : /input/zeek/current -> spool/zeek
+ln -sfn "spool/zeek" "$LOGDIR/current"
+if [ ! -e "$LOGDIR/current" ]; then
+  echo "[ndr-zeek] WARNING: $LOGDIR/current masih dangling setelah deploy" >&2
+fi
 
 LAST_ARCHIVE="$(date +%s)"
 while true; do
   sleep 60
+
+  # v0.16.1 (P0-2): self-heal symlink - zeekctl deploy/cron dapat
+  # membuat ulang symlink 'current' (absolut) miliknya; kalau target
+  # kita hilang atau tidak lagi menunjuk spool/zeek, buat ulang.
+  if [ ! -e "$LOGDIR/current" ] \
+     || [ "$(readlink "$LOGDIR/current" 2>/dev/null)" != "spool/zeek" ]; then
+    ln -sfn "spool/zeek" "$LOGDIR/current"
+  fi
 
   # Archive + rotate logs (zeekctl cron handles this safely)
   zeekctl cron >/dev/null 2>&1 || true

@@ -37,11 +37,26 @@ echo "[upgrade] running idempotent schema init (postgres/init is applied on firs
 # SQLAlchemy create_all runs on API start; destructive migrations are manual.
 
 echo "[upgrade] restarting application layer..."
-docker compose up -d ndr-api ndr-ui ndr-pipeline
+# v0.16.1 (P2-5): --force-recreate pada aplikasi memastikan container
+# benar-benar memakai image baru (kasus lapangan: suricata tetap jalan
+# dengan image lama setelah build karena container tidak di-recreate).
+docker compose up -d --force-recreate ndr-api ndr-ui ndr-pipeline
+
+echo "[upgrade] recreating sensor layer (image may have changed)..."
+# v0.16.1 (P2-5): sensor TIDAK lagi andal pada perilaku default
+# `up -d` - wajib --force-recreate agar image baru benar-benar dipakai.
+# Efek samping sah: checkpoint log di-reset? TIDAK - pipeline checkpoint
+# v2 (B3) memvalidasi [dev,ino]; inode log Zeek baru menyebabkan file
+# baru dibaca dari EOF (pipeline tetap aman, tidak membanjiri ulang).
+docker compose --profile sensor up -d --force-recreate zeek suricata arkime 2>/dev/null \
+  || docker compose up -d --force-recreate zeek suricata arkime 2>/dev/null \
+  || echo "[upgrade] sensor services not present (base-only deployment)"
 
 echo "[upgrade] waiting 15s and probing health..."
 sleep 15
-if curl -sf http://127.0.0.1:${API_PORT:-8080}/api/meta >/dev/null 2>&1; then
+# v0.16.1 (P2-7): /api/version; fallback /api/meta untuk upgrade lama
+if curl -sf http://127.0.0.1:${API_PORT:-8080}/api/version >/dev/null 2>&1 \
+   || curl -sf http://127.0.0.1:${API_PORT:-8080}/api/meta >/dev/null 2>&1; then
   echo "[upgrade] API healthy"
 else
   echo "[upgrade] ERROR: API not healthy - roll back with:"

@@ -17,7 +17,10 @@ from tests.conftest import login
 def test_build_expression_basic():
     expr = arkime.build_expression(["203.0.113.25"], ["c2.evil.test"],
                                    [443])
-    assert 'ip == "203.0.113.25"' in expr
+    # v0.16.0: nilai IP TANPA kutip - quirk Arkime 5.6.2 terverifikasi
+    # live (fix §27c-4): 'ip == "x"' -> "not a valid ip". String (host)
+    # tetap di-quote, port numeric polos.
+    assert "ip == 203.0.113.25" in expr
     assert 'host == "c2.evil.test"' in expr
     assert "port == 443" in expr
     assert " || " in expr
@@ -42,14 +45,16 @@ def test_build_expression_empty_inputs():
 
 # ------------------------------------------------------- deep links
 def test_session_viewer_url_shape():
-    url = arkime.session_viewer_url('ip == "203.0.113.25"', 1760000000,
+    url = arkime.session_viewer_url('ip == 203.0.113.25', 1760000000,
                                     1760003600)
-    assert url.startswith(config.arkime_viewer_url)
+    # v0.16.0: deep link ke PUBLIC BASE (browser lewat proxy SSO API),
+    # bukan URL internal viewer - sesuai desain bake SSO (req 13).
+    assert url.startswith(config.arkime_public_base.rstrip("/"))
     assert "/sessions?" in url
     assert "startTime=1760000000" in url
     assert "stopTime=1760003600" in url
     # expression is URL-encoded (spaces safe-quoted away)
-    assert "expression=ip%20%3D%3D%20%22203.0.113.25%22" in url
+    assert "expression=ip%20%3D%3D%20203.0.113.25" in url
 
 
 def test_probe_unreachable_is_honest(monkeypatch):

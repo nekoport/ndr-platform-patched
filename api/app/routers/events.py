@@ -26,10 +26,19 @@ def search_events(body: SearchRequest, request: Request,
                   db: Session = Depends(get_db)):
     search_limiter.check(user.username)
     try:
+        # v0.16.1 (P0-5): mode simple dibangun SERVER dari query_text
+        # (dulu client mengirim term teks ke field ip -> parsing gagal,
+        # hasil selalu 0). query DSL mentah tetap hanya utk mode advanced.
+        query = body.query
+        if body.query_text:
+            built = get_os().build_free_text_query(body.query_text)
+            if built:
+                query = built
         result = get_os().guarded_search(
-            alias=body.index, query=body.query, size=body.size,
+            alias=body.index, query=query, size=body.size,
             from_=body.from_, sort=body.sort,
-            time_from=body.time_from, time_to=body.time_to)
+            time_from=body.time_from, time_to=body.time_to,
+            exact_total=body.exact_total)
     except DSLValidationError as e:
         audit(db, request, action="events.search", result="failure",
               target_type="index", target_id=body.index,

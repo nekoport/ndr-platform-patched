@@ -22,7 +22,7 @@ from app.correlation.service import ReconstructionService
 from app.correlation.store import IncidentStore
 from app.dedup import DedupStore
 from app.detection import DetectionEngine
-from app.enrich import ZoneEnricher
+from app.enrich import GamblingWatchlist, ZoneEnricher
 from app.geoip import GeoEnricher
 from app.intel.collector import IntelService
 from app.intel.matcher import MatcherRefresher
@@ -72,6 +72,13 @@ class Pipeline:
         self.raw_archive = RawArchive(self.cfg.state_dir, self.cfg.raw_retention_hours)
         self.dedup = DedupStore(capacity=200_000)
         self.zones = ZoneEnricher(self.cfg.zones)
+        # ---- v0.16.0: watchlist judi online (req 18) - tag campaign ----
+        self.gambling = GamblingWatchlist(self.cfg.gambling_keywords,
+                                          self.cfg.gambling_domains_file)
+        if self.gambling.keywords or self.gambling.domains:
+            print(f"[ndr-pipeline] gambling watchlist enabled "
+                  f"(keywords={len(self.gambling.keywords)}, "
+                  f"domains={len(self.gambling.domains)})", file=sys.stderr)
         # ---- geoip enrichment (Phase 5, optional, off by default) ----
         self.geo = GeoEnricher(self.cfg.geoip_mmdb_path,
                                self.cfg.geoip_json_path)
@@ -83,7 +90,9 @@ class Pipeline:
             out_queue=self.raw_queue,
             checkpoint_path=f"{self.cfg.state_dir}/checkpoints.json",
             name="log-tailer")
-        self.detection = DetectionEngine(self.cfg, self.detect_queue, self.sink_queue)
+        self.detection = DetectionEngine(self.cfg, self.detect_queue,
+                                         self.sink_queue,
+                                         geo_enricher=self.geo)
         # v0.13.0: detection drop counter feeds the same metrics registry
         self.detection.metrics = self.metrics
         self.sink = OpenSearchSink(
@@ -181,6 +190,7 @@ class Pipeline:
         ev.raw_event_ref = self.raw_archive.store(engine, line)
         self.zones.enrich(ev)
         self.geo.enrich_event(ev)
+        self.gambling.enrich(ev)
 
         index_date = ev.event_time.strftime("%Y.%m.%d")
         if ev.source_engine == "suricata":

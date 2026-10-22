@@ -126,6 +126,29 @@ class Config:
         "DETECT_LATERAL_CROSS_ZONE_MIN", 5)
     detect_exfil_min_bytes: int = _env_int("DETECT_EXFIL_MIN_BYTES", 100_000_000)
 
+    # ---------------------------------------------------------------- v0.16.0
+    # auth brute force: gagal auth HTTP (401/403) berulang per (src, dst)
+    detect_bruteforce_enabled: bool = _env_bool("DETECT_BRUTEFORCE", True)
+    detect_bruteforce_min_failures: int = _env_int(
+        "DETECT_BRUTEFORCE_MIN_FAILURES", 20)
+    detect_bruteforce_window_min: int = _env_int(
+        "DETECT_BRUTEFORCE_WINDOW_MIN", 10)
+
+    # watchlist judi online (requirement 18): keyword matcher pada host/dns.
+    # CAMPAIGN tag dipasang di enrichment; detector gambling_access canary
+    # (matikan dengan DETECT_GAMBLING=0 tanpa redeploy).
+    gambling_keywords: list[str] = field(default_factory=lambda: [
+        k.strip().lower() for k in _env_list(
+            "GAMBLING_KEYWORDS",
+            "judi,slot,togel,sbobet,casino,poker,baccarat,parlay,"
+            "sbobet88,judol") if k.strip()])
+    gambling_domains_file: str | None = (
+        os.environ.get("GAMBLING_DOMAINS_FILE") or None)
+    detect_gambling: bool = _env_bool("DETECT_GAMBLING", True)
+    detect_gambling_window_min: int = _env_int(
+        "DETECT_GAMBLING_WINDOW_MIN", 10)
+    detect_gambling_min_hits: int = _env_int("DETECT_GAMBLING_MIN_HITS", 3)
+
     # attack reconstruction engine (Phase 4, doc section 10)
     recon_enabled: bool = _env_bool("RECON_ENABLED", True)
     recon_max_gap_seconds: int = _env_int("RECON_MAX_GAP_SECONDS", 7200)

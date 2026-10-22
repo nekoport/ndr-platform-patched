@@ -205,12 +205,69 @@ class HealthPublisher(threading.Thread):
             "backlog_seconds": snap["backlog_seconds"],
             "last_event_time": snap["last_event_time"],
             "tailer_state": snap["gauges"].get("tailer_state", "unknown"),
+            # v0.16.1 (P2-1): metrik per-komponen pipeline. Dulu panel
+            # "Capture stack components" kosong karena health doc tidak
+            # punya bagian komponen. Ini metrik NYATA dari proses pipeline
+            # (bukan CPU% proses sensor yang tidak bisa diamati lintas
+            # container - untuk itu pakai `docker stats` di host).
+            "components": self._components(snap),
         }
         try:
             self.client.index(index=index, id=doc_id, body=doc, refresh=False)
         except Exception:
             pass  # health is best-effort; OS unavailability is visible elsewhere
         self._heartbeat()
+
+    @staticmethod
+    def _components(snap: dict) -> list[dict]:
+        """Bangun daftar komponen pipeline dari snapshot metrik (P2-1).
+
+        ok = keadaan internal yang bisa dibuktikan dari metrik sendiri
+        (queue tidak penuh, tailer streaming) - TIDAK pernah mengarang
+        keadaan proses Zeek/Suricata yang tidak terlihat dari container
+        pipeline.
+        """
+        counters = snap.get("counters", {})
+        gauges = snap.get("gauges", {})
+        eps_engine = snap.get("eps_by_engine", {})
+        queue_depth = int(gauges.get("queue_depth", 0) or 0)
+        queue_cap = int(gauges.get("queue_capacity", 0) or 0)
+        sink_pending = int(gauges.get("sink_pending", 0) or 0)
+        tailer_state = str(gauges.get("tailer_state", "unknown"))
+        backlog = snap.get("backlog_seconds")
+        backlog_txt = (f"{backlog:.0f}s" if isinstance(backlog, (int, float))
+                       else "n/a")
+
+        def eps(engine: str) -> float:
+            v = eps_engine.get(engine)
+            if v is None:
+                v = eps_engine.get(f"events_{engine}", 0)
+            try:
+                return round(float(v), 2)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return [
+            {"name": "tailer", "ok": tailer_state in ("streaming", "ok"),
+             "detail": f"state={tailer_state}; backlog={backlog_txt}"},
+            {"name": "ingest-zeek", "ok": True,
+             "detail": f"{eps('zeek')} eps", "eps": eps("zeek")},
+            {"name": "ingest-suricata", "ok": True,
+             "detail": f"{eps('suricata')} eps", "eps": eps("suricata")},
+            {"name": "normalize", "ok": True,
+             "detail": (f"parse_errors {int(counters.get('parse_errors', 0))}, "
+                        f"duplicates {int(counters.get('duplicates', 0))}, "
+                        f"dropped {int(counters.get('dropped', 0))}")},
+            {"name": "detection", "ok": queue_cap == 0 or queue_depth < queue_cap,
+             "detail": f"queue {queue_depth}/{queue_cap or '?'}"},
+            {"name": "sink-opensearch", "ok": sink_pending < 10000,
+             "detail": f"pending {sink_pending}; indexed "
+                       f"{int(counters.get('events_indexed', 0))}"},
+            {"name": "correlation",
+             "ok": True,
+             "detail": (f"stories open {int(gauges.get('recon_open_stories', 0))}, "
+                        f"dirty {int(gauges.get('recon_dirty_stories', 0))}")},
+        ]
 
     def stop(self) -> None:
         if self._httpd:

@@ -11,20 +11,47 @@ Advanced DSL is exposed ONLY through this guard:
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from opensearchpy import NotFoundError, OpenSearch
+from opensearchpy import NotFoundError, OpenSearch, RequestError
 
 from app.config import config
 
+# v0.16.1 (P0-5): field teks yang boleh disentuh free-text search yang
+# DIBANGUN SERVER (bukan DSL mentah user). IP tidak masuk sini - nilai
+# non-IP pada field bertipe ip membuat parser gagal / hasil selalu 0.
+FREE_TEXT_FIELDS = (
+    "dns.query", "http.host", "http.url", "tls.sni", "alert.signature",
+    "dns_domains", "campaign", "title",
+)
+# fast-path event_type: kata kunci persis ini langsung menjadi filter
+# term event_type sehingga preset seperti "All DNS events" menargetkan
+# event yang benar SEKALIGUS murah (bukan wildcard lintas 30+ juta dok).
+EVENT_TYPE_VALUES = {
+    "alert", "dns", "conn", "http", "tls", "files", "notice", "weird",
+    "dpd", "software", "ssl", "x509", "ntp", "ssh", "smtp", "snmp",
+}
+IP_LIKE_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$")
+GREASE_VALUES = {2570, 3230, 3240, 4865, 4866, 4867, 5248, 5250, 5251,
+                 6066, 6067, 6682}
+
 ALLOWED_QUERY_KEYS = {"bool", "term", "terms", "range", "match",
-                      "match_phrase", "exists", "prefix"}
+                      "match_phrase", "exists", "prefix", "wildcard"}
 ALLOWED_BOOL_KEYS = {"filter", "must", "should", "must_not",
                      "minimum_should_match"}
 FORBIDDEN_KEYS = {"script", "script_score", "regexp", "fuzzy", "query_string",
-                  "wildcard", "nested", "more_like_this", "percolate"}
+                  "nested", "more_like_this", "percolate"}
+# v0.16.0 (req 5): wildcard kini diizinkan HANYA pada field keyword/wildcard
+# yang dipetakan eksplisit (termasuk field tipe 'wildcard' OpenSearch yang
+# dioptimalkan untuk ini). Leading-wildcard tetap dilarang di prefix.
+WILDCARD_FIELDS = {
+    "dns.query", "http.host", "http.url", "tls.sni", "tls.ja3",
+    "alert.signature", "top_rules.signature", "title", "campaign",
+    "dns_domains", "category",
+}
 ALLOWED_SORT_FIELDS = {"@timestamp", "ingest_time", "severity_score",
                        "event_count", "last_seen", "first_seen"}
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -40,12 +67,66 @@ class OSClient:
                                  timeout=15)
 
     # ------------------------------------------------------------ guard
-    def validate_alias(self, alias: str) -> str:
+    def validate_alias(self, alias: str | list[str]) -> str | list[str]:
+        """Whitelist alias. v0.16.1: menerima list utk fan-out multi-alias
+        (semua elemen tetap wajib ada di whitelist)."""
+        if isinstance(alias, list):
+            for a in alias:
+                if a not in config.allowed_read_aliases:
+                    raise DSLValidationError(
+                        f"index '{a}' is not an allowed read alias; "
+                        f"allowed: {', '.join(config.allowed_read_aliases)}")
+            return alias
         if alias not in config.allowed_read_aliases:
             raise DSLValidationError(
                 f"index '{alias}' is not an allowed read alias; "
                 f"allowed: {', '.join(config.allowed_read_aliases)}")
         return alias
+
+    # ------------------------------------------------- free-text (P0-5)
+    @staticmethod
+    def build_free_text_query(text: str | None) -> dict | None:
+        """Bangun query free-text yang BENAR dari kata kunci analis
+        (v0.16.1, P0-5) - dipanggil API, BUKAN dari DSL mentah client.
+
+        Aturan:
+        1. Nilai mirip IP/CIDR -> term pada field ip (parser IP valid).
+        2. Kata kunci persis nama event_type (dns/http/tls/...) -> term
+           event_type (preset 'All DNS events' kini benar + murah).
+        3. Selain itu -> wildcard case-insensitive pada whitelist field
+           keyword/teks (FREE_TEXT_FIELDS), TIDAK PERNAH pada field ip.
+
+        Query hasilnya API-constructed (tidak lewat validate_query user)
+        tetapi tetap dibatasi field whitelist - prinsip guard sama.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        if len(text) > 256:
+            text = text[:256]
+        should: list[dict] = []
+        if IP_LIKE_RE.match(text):
+            try:
+                ipaddress.ip_network(text, strict=False)
+                # fast-path IP: HANYA term field ip - tanpa wildcard
+                # (murah dan tepat; wildcard *ip* di 30jt+ dok mahal)
+                should.extend([
+                    {"term": {"source.ip": text}},
+                    {"term": {"destination.ip": text}},
+                ])
+                return {"bool": {"minimum_should_match": 1,
+                                 "should": should}}
+            except ValueError:
+                pass  # bukan IP valid -> jatuh ke jalur teks
+        low = text.lower()
+        if low in EVENT_TYPE_VALUES:
+            should.append({"term": {"event_type": low}})
+        needle = f"*{low}*"
+        for field in FREE_TEXT_FIELDS:
+            should.append({"wildcard": {field: {"value": needle}}})
+        if not should:
+            return None
+        return {"bool": {"minimum_should_match": 1, "should": should}}
 
     def validate_query(self, query: Any, depth: int = 0) -> None:
         if depth > 6:
@@ -70,9 +151,27 @@ class OSClient:
                     elif isinstance(bv, dict):
                         self.validate_query(bv, depth + 1)
             elif key in ("term", "terms", "match", "match_phrase", "exists",
-                         "prefix"):
+                         "prefix", "wildcard"):
                 if not isinstance(value, dict):
                     raise DSLValidationError(f"{key} must be an object")
+                if key == "wildcard":
+                    for wfield, wval in value.items():
+                        if wfield not in WILDCARD_FIELDS:
+                            raise DSLValidationError(
+                                f"wildcard on field '{wfield}' is not allowed; "
+                                f"allowed: {sorted(WILDCARD_FIELDS)}")
+                        if isinstance(wval, dict):
+                            unknown = set(wval) - {"value", "case_insensitive",
+                                                   "boost"}
+                            if unknown:
+                                raise DSLValidationError(
+                                    f"wildcard options not allowed: "
+                                    f"{sorted(unknown)}")
+                            wval = wval.get("value", "")
+                        if not isinstance(wval, str):
+                            raise DSLValidationError(
+                                "wildcard value must be a string")
+                    continue
                 if key == "prefix":
                     for _field, fval in value.items():
                         if isinstance(fval, dict):
@@ -136,9 +235,10 @@ class OSClient:
         }}}
 
     # ------------------------------------------------------------ search
-    def guarded_search(self, *, alias: str, query: dict | None,
+    def guarded_search(self, *, alias: str | list[str], query: dict | None,
                        size: int, from_: int, sort: list | None,
-                       time_from: str | None, time_to: str | None) -> dict:
+                       time_from: str | None, time_to: str | None,
+                       exact_total: bool = False) -> dict:
         alias = self.validate_alias(alias)
         query = query or {}
         self.validate_query(query)
@@ -153,7 +253,9 @@ class OSClient:
         body: dict[str, Any] = {
             "size": min(size, config.search_max_size),
             "from": min(from_, 10000),
-            "track_total_hits": 10000,
+            # v0.16.1 (P2-4): default tetap di-cap 10.000 (murah); client
+            # dapat minta exact total untuk analisis/ekspor skala besar.
+            "track_total_hits": True if exact_total else 10000,
             "query": {"bool": {"filter": filters}},
             "_source": {"excludes": ["raw_line"]},
         }
@@ -166,7 +268,7 @@ class OSClient:
             request_timeout=config.search_timeout_seconds,
         )
 
-    def guarded_aggregate(self, *, alias: str, query: dict | None,
+    def guarded_aggregate(self, *, alias: str | list[str], query: dict | None,
                           aggs: dict, time_from: str | None,
                           time_to: str | None) -> dict:
         """Aggregation-only search over a whitelisted alias (v0.12.7).
@@ -176,6 +278,11 @@ class OSClient:
         with size 0 - the response carries ONLY bucket counts, never
         documents. Used by /api/alerts/stats so the Alert Center header
         charts are exact for result sets of any size.
+
+        v0.16.1 (P1-5): alias boleh berupa LIST alias whitelist (mis.
+        ndr-zeek-tls-read + ndr-suricata-read) sehingga agregasi TLS
+        mencakup JA3/issuer dari Suricata EVE juga - fan-out multi-alias
+        adalah operasi search normal di OpenSearch.
         """
         alias = self.validate_alias(alias)
         query = query or {}
@@ -195,14 +302,42 @@ class OSClient:
         )
 
     def get_by_id(self, alias: str, doc_id: str) -> dict | None:
-        """Direct _id lookup. v0.12.6: ONLY a genuine 404 returns None;
-        any other backend failure propagates so callers can answer 502
-        instead of a misleading 'not found'."""
+        """Resolve satu dokumen by _id, AMAN untuk alias multi-index.
+
+        v0.16.1 (P0-4): jalur utama kini ids-QUERY (search), bukan GET
+        single-index. Akar bug 502: pada alias harian (ndr-alerts-read
+        berisi 9+ index), GET by _id ditolak OpenSearch ("alias [...] has
+        more than one index ... can't execute a single index op") dan
+        guard lama GAGAL menangkapnya karena memeriksa exc.error yang
+        berisi 'illegal_argument_exception' (tipe error), BUKAN pesan
+        alias. Guard kini memeriksa SELURUH argumen exception.
+        """
         alias = self.validate_alias(alias)
+        doc_id = str(doc_id or "").strip()
+        if not doc_id:
+            return None
         try:
-            return self.client.get(index=alias, id=doc_id)
+            res = self.client.search(index=alias, body={
+                "size": 2,
+                "query": {"ids": {"values": [doc_id]}},
+                "_source": {"excludes": ["raw_line"]},
+            })
+            hits = (res.get("hits") or {}).get("hits") or []
+            for h in hits:  # prefer exact _id match
+                if h.get("_id") == doc_id:
+                    return h
+            return hits[0] if hits else None
         except NotFoundError:
             return None
+        except RequestError as exc:
+            # v0.16.1: gabungkan SEMUA argumen (status_code, error, info)
+            # sehingga pesan alias 'more than one index' benar-benar kena.
+            msg = " ".join(str(a) for a in getattr(exc, "args", []) if a)
+            if not msg:
+                msg = str(exc)
+            if "more than one index" in msg or "single index op" in msg:
+                return None  # degrade -> caller fallback (search_alert_doc)
+            raise
 
     # v0.12.6: alert resolution used to rely on a bare GET-by-id against
     # the ndr-alerts-read alias. On a live deployment that alias spans one
@@ -230,19 +365,8 @@ class OSClient:
     def get_alert_doc(self, alert_id: str) -> dict | None:
         """Resolve one alert across the read alias: exact _id get first,
         then a term search on the alert_id field. Returns None only when
-        the alert genuinely does not exist; backend failures raise.
-
-        v0.15 deployment note: the read alias can legitimately hold
-        MULTIPLE daily indices (ensure-index + downstream); OpenSearch
-        then rejects the single-index GET op - degrade to the term
-        search instead of failing the alert detail page with a 502.
-        """
-        try:
-            doc = self.get_by_id("ndr-alerts-read", alert_id)
-        except Exception as e:  # noqa: BLE001 - multi-index alias is normal
-            if "more than one index" not in str(e):
-                raise
-            doc = None
+        the alert genuinely does not exist; backend failures raise."""
+        doc = self.get_by_id("ndr-alerts-read", alert_id)
         if doc is not None:
             return doc
         return self.search_alert_doc(alert_id)
@@ -322,10 +446,25 @@ class OSClient:
     def nodes_fs_stats(self) -> dict:
         return self.client.nodes.stats(metric="fs,indices")
 
-    def count(self, alias: str, query: dict | None = None) -> int:
+    def count(self, alias: str | list[str], query: dict | None = None) -> int:
         alias = self.validate_alias(alias)
         body = {"query": query} if query else None
         return int(self.client.count(index=alias, body=body)["count"])
+
+    def exact_total(self, alias: str | list[str],
+                    query: dict | None = None) -> int:
+        """v0.16.1 (P2-4/P1-4): total dokumen EKSAK lewat agg filter
+        match_all (hitung agg tidak terpengaruh track_total_hits cap).
+        Dipakai DNS/TLS summary agar rasio tidak pernah melebihi 100%."""
+        body: dict[str, Any] = {
+            "size": 0,
+            "track_total_hits": 0,
+            "query": query or {"match_all": {}},
+            "aggs": {"n": {"filter": {"match_all": {}}}},
+        }
+        res = self.client.search(index=self.validate_alias(alias), body=body)
+        return int(res.get("aggregations", {}).get("n", {})
+                   .get("doc_count", 0))
 
     def aggregate(self, alias: str, body: dict) -> dict:
         """Aggregations are API-constructed only (never user DSL)."""

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app.models import Answer, CommonEvent, make_dedup_key, make_event_id
+from app.models import (Answer, CommonEvent, compute_ja3, make_dedup_key,
+                        make_event_id)
 
 # Suricata alert severity (1..4) -> label + score
 SURICATA_SEVERITY = {1: ("critical", 95), 2: ("high", 75),
@@ -223,7 +224,15 @@ def parse_zeek(raw: str, sensor_id: str, log_type: str,
     elif log_type == "tls":
         ev.tls_version = j.get("version")
         ev.tls_sni = j.get("server_name")
-        ev.tls_ja3 = j.get("ja3")
+        # v0.16.1 (P1-5): Zeek polos tidak punya ja3 - hitung dari bahan
+        # client-hello yang Zeek 5+ log (cipher/extension/curve/point
+        # format). Kalau suatu hari ada plugin ja3, field itu yang menang.
+        ev.tls_ja3 = j.get("ja3") or compute_ja3(
+            j.get("version"),
+            j.get("client_cipher_suites"),
+            j.get("client_extensions"),
+            j.get("client_curves"),
+            j.get("client_point_formats"))
         ev.tls_subject = _clip(j.get("subject"), 512)
         ev.tls_issuer = _clip(j.get("issuer"), 512)
     elif log_type == "files":

@@ -15,6 +15,7 @@ Rules:
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from collections import Counter
@@ -51,6 +52,121 @@ _ATTEMPT_CATEGORIES = ("attempted", "exploit", "web-application", "attack")
 _INDETERMINATE_CATEGORIES = ("policy", "activity", "misc", "bad-unknown",
                              "unknown", "default")
 _SUCCESS_SIGNATURES = ("ATTACK_RESPONSE", "ATTACK-RESPONSE")
+
+
+# ---------------------------------------------------------------- v0.16.0
+# requirement 3: status keberhasilan anomali dengan kosakata tender
+# (Compromise / Attempt / Failure / Attack Successful) selain kosakata
+# internal v0.10 (suspected_success / attempted / indeterminate).
+#   attempt            - bukti percobaan saja (signature kelas exploit)
+#   failure            - server MENOLAK: bukti respons HTTP 4xx (auth/404)
+#                        atau kelas policy yang jelas-ditolak
+#   attack_successful  - server BEREAKSI: signature server-reaction
+#                        (ATTACK_RESPONSE) atau respons HTTP 2xx/3xx pada
+#                        kelas serangan. BUKAN klaim kompromi.
+#   compromise         - TIDAK pernah diberikan di level deteksi.
+#                        Kompromi adalah klaim insiden (correlation engine
+#                        strong_success + TI C2) - lihat /api/incidents
+#                        tender_status. No-overclaim.
+_ATTACK_STATUS_LABELS = {
+    "attempt": "Attempt",
+    "failure": "Failure",
+    "attack_successful": "Attack Successful",
+    "compromise": "Compromise",
+    "indeterminate": "Indeterminate",
+}
+
+def attack_status_for(alert_type: str, suricata_category: str | None = None,
+                      top_signature: str | None = None,
+                      http_statuses: list[int] | None = None) -> str:
+    """Tender-vocabulary status (v0.16.0, requirement 3).
+
+    Menggabungkan verdict v0.10 (kategori signature) dengan bukti respons
+    HTTP yang terbawa event alert (EVE alert memuat blok http bila app-layer
+    tercatat). Failure hanya dari bukti penolakan eksplisit; kompromi tidak
+    pernah diklaim di level alert.
+    """
+    outcome = outcome_for_alert(alert_type, suricata_category, top_signature)
+    statuses = [int(s) for s in (http_statuses or []) if s]
+    # 1. bukti reaksi server dari respons HTTP menang lebih dulu
+    if statuses:
+        if any(200 <= s < 400 for s in statuses):
+            cat = (suricata_category or "").lower()
+            sig = (top_signature or "").upper()
+            if (any(c in cat for c in _SUCCESS_CATEGORIES)
+                    or any(s in sig for s in _SUCCESS_SIGNATURES)
+                    or any(c in cat for c in _MALWARE_CATEGORIES)):
+                return "attack_successful"
+            return "attempt"
+        if all(s >= 400 for s in statuses):
+            return "failure"
+    # 2. tanpa respons HTTP: peta dari verdict v0.10
+    return {"suspected_success": "attack_successful",
+            "attempted": "attempt",
+            "indeterminate": "indeterminate"}.get(outcome, "indeterminate")
+
+
+def detection_engine_for(alert_type: str) -> str:
+    """requirement 1: label asal deteksi (signature/behaviour/intel).
+
+    Rules custom Suricata berlabel 'proprietary' di Rules Manager (API tahu
+    sumbernya); di level alert pemisahan utamanya signature vs behaviour
+    vs intel-match.
+    """
+    if alert_type == "suricata_alert_group":
+        return "signature"
+    if alert_type == "ioc_match":
+        return "intel"
+    return "behaviour"
+
+
+_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
+
+def cve_for(top_signature: str | None,
+            reasons: list[str] | None = None) -> list[str]:
+    """requirement 10: ekstrak CVE dari nama signature/reason (ET
+    menuliskan CVE pada msg rule, mis. '... CVE-2021-44228 ...').
+    Dedup + urut stabil; field keyword agar bisa difilter/agregasi.
+    """
+    found: list[str] = []
+    for text in [top_signature or "", *(reasons or [])]:
+        for m in _CVE_RE.findall(text or ""):
+            up = m.upper()
+            if up not in found:
+                found.append(up)
+    return found[:8]
+
+
+def explanation_for(*, title: str, attack_status: str, stage: str,
+                    stage_label: str, mitre: list[dict], source_ip: str | None,
+                    destination_ip: str | None, protocol: str | None,
+                    event_count: int, cve: list[str]) -> str:
+    """requirement 10: penjelasan anomali satu kalimat terstruktur.
+
+    Human-readable, deterministic (template - bukan LLM), dan jujur:
+    selalu menyatakan status sebagai bukti-level-jaringan. Disimpan
+    'index':false - tidak untuk pencarian, hanya tampilan detail.
+    """
+    tech = ", ".join(sorted({f"{m.get('technique_id')} {m.get('technique')}"
+                             for m in (mitre or [])
+                             if isinstance(m, dict) and m.get("technique_id")}))
+    path = f"{source_ip or '?'} -> {destination_ip or '?'}"
+    if protocol:
+        path = f"{path} ({protocol})"
+    parts = [
+        f"Anomali '{title}' terdeteksi pada {path} "
+        f"dari {event_count} event.",
+        f"Tahapan: {stage_label} ({stage}).",
+    ]
+    if tech:
+        parts.append(f"Teknik MITRE ATT&CK: {tech}.")
+    parts.append(
+        f"Status keberhasilan: {_ATTACK_STATUS_LABELS.get(attack_status, attack_status)} "
+        f"- kesimpulan berbasis bukti jaringan, bukan verifikasi endpoint.")
+    if cve:
+        parts.append(f"Referensi kerentanan: {', '.join(cve)}.")
+    return " ".join(parts)
 
 
 def outcome_for_alert(alert_type: str, suricata_category: str | None = None,
@@ -114,7 +230,11 @@ def build_alert_doc(*, alert_id: str, alert_type: str, title: str, group_key: st
                     attack_phase: str | None = None,
                     suricata_category: str | None = None,
                     ioc_type: str | None = None,
-                    dns_domains: list[str] | None = None) -> dict:
+                    dns_domains: list[str] | None = None,
+                    http_statuses: list[int] | None = None,
+                    dga_score: float | None = None,
+                    campaign: str | None = None,
+                    force_status: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
     # Dual-framework classification (doc 11): kill-chain stage + MITRE
     # ATT&CK techniques computed once and carried on the alert doc.
@@ -171,7 +291,14 @@ def build_alert_doc(*, alert_id: str, alert_type: str, title: str, group_key: st
         "network": {"transport": transport, "protocol": protocol},
         "top_sources": [{"ip": ip, "count": c} for ip, c in top_sources[:10]],
         "top_destinations": [{"ip": ip, "count": c} for ip, c in top_destinations[:10]],
-        "top_rules": [{"signature": sig, "count": c} for sig, c in top_rules[:10]],
+        "top_rules": [
+            # v0.16.0: entry 2- atau 3-elemen (signature, count[, sid]) -
+            # signature_id diperlukan agregasi hit per rule (req 14/15).
+            {"signature": entry[0], "count": entry[1],
+             **({"signature_id": str(entry[2])}
+                if len(entry) > 2 and entry[2] else {})}
+            for entry in top_rules[:10]
+        ],
         "evidence": evidence[:10],
         "related_entities": sorted({ip for ip in
                                     [source_ip, destination_ip] if ip}),
@@ -179,6 +306,30 @@ def build_alert_doc(*, alert_id: str, alert_type: str, title: str, group_key: st
         "outcome": outcome_for_alert(alert_type, suricata_category,
                                      top_rules[0][0] if top_rules else None),
     }
+    # ---------------------------------------------------------------- v0.16.0
+    # requirements 1/3/10/18: label mesin deteksi, status keberhasilan
+    # (kosakata tender), CVE, penjelasan, skor DGA, dan campaign watchlist.
+    _top_sig = top_rules[0][0] if top_rules else None
+    # v0.16.0: detector tertentu (mis. auth_bruteforce) punya makna status
+    # yang jelas dari buktinya sendiri - boleh force, selain itu hitung.
+    attack_status = force_status or attack_status_for(
+        alert_type, suricata_category, _top_sig, http_statuses)
+    cves = cve_for(_top_sig, reasons)
+    doc["attack_status"] = attack_status
+    doc["detection_engine"] = detection_engine_for(alert_type)
+    doc["explanation"] = explanation_for(
+        title=title, attack_status=attack_status, stage=kc_stage,
+        stage_label=STAGE_LABELS.get(kc_stage, kc_stage), mitre=kc_attck,
+        source_ip=source_ip, destination_ip=destination_ip,
+        protocol=protocol, event_count=event_count, cve=cves)
+    # explanation TIDAK untuk pencarian (diet indeks - pelajaran §19);
+    # template menandai index:false.
+    if cves:
+        doc["cve"] = cves
+    if dga_score is not None:
+        doc["dga_score"] = round(float(dga_score), 1)
+    if campaign:
+        doc["campaign"] = campaign
     if matched_iocs:
         doc["matched_iocs"] = matched_iocs[:5]
     # v0.14.0: structured sampled domains (DGA/NXDOMAIN/tunneling) so
@@ -324,6 +475,10 @@ class SuricataAlertGrouper(BaseRule):
         sig_id = next(iter(sig_ids), "")
         suricata_cat = next(iter({e.alert_category for e in events
                                   if e.alert_category}), None)
+        # v0.16.0: bukti respons HTTP (EVE alert membawa blok http bila
+        # app-layer tercatat) untuk attack_status req 3, campaign req 18.
+        statuses = [e.http_status for e in events if e.http_status]
+        campaign = next((e.campaign for e in events if e.campaign), None)
         window_start = first
 
         alert_id = make_alert_id(self.name, key, window_start)
@@ -353,8 +508,10 @@ class SuricataAlertGrouper(BaseRule):
             transport=events[0].transport, protocol=events[0].protocol,
             top_sources=src_ips.most_common(),
             top_destinations=dst_ips.most_common(),
-            top_rules=[(sig_label, len(events))] if sig_label else [],
+            # v0.16.0: sid disertakan utk statistik hit per rule (req 14/15)
+            top_rules=[(sig_label, len(events), sig_id)] if sig_label else [],
             evidence=_evidence_refs(events, next(iter(indexes), "ndr-suricata")),
+            http_statuses=statuses, campaign=campaign,
         )
         self.emit(doc)
 

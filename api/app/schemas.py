@@ -83,6 +83,18 @@ class SearchRequest(BaseModel):
 
     index: str = "ndr-events-read"
     query: dict[str, Any] = Field(default_factory=dict)
+    # v0.16.0 (req 5): custom filter DSL (and/or/not + is/is_one/include/
+    # exclude) - AST JSON divalidasi app.filters.build_query, bukan DSL mentah.
+    filter: dict[str, Any] | None = None
+    # v0.16.1 (P0-5): mode simple TIDAK lagi dibangun di client (dulu
+    # 'term' teks pada field ip membuat hasil selalu 0). Kirim kata
+    # kunci mentah; API membangun query-nya sendiri via
+    # OSClient.build_free_text_query (whitelist field, IP fast-path,
+    # event_type fast-path).
+    query_text: str | None = Field(default=None, max_length=256)
+    # v0.16.1 (P2-4): minta total EKSAK (tanpa cap 10.000) untuk
+    # analisis/ekspor skala besar.
+    exact_total: bool = False
     size: int = Field(default=50, ge=1, le=500)
     from_: int = Field(default=0, ge=0, alias="from", le=10000)
     sort: list[dict[str, Any]] | None = None

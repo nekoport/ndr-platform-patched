@@ -69,10 +69,13 @@ def test_alert_stats_shape_and_guard(client, _fake_os, monkeypatch):
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["total"] == 1234
-    assert body["severity"]["high"] == 900
-    assert body["severity"]["critical"] == 334
-    assert body["status"]["new"] == 1200
-    assert body["outcome"]["attempted"] == 1000
+    # v0.16.0 (bug A6 fix): buckets = LIST {key,count} urut count desc;
+    # bentuk dict 0.13.0 tetap tersedia di body["aggregations"].
+    assert body["severity"][0] == {"key": "high", "count": 900}
+    assert {b["key"]: b["count"] for b in body["severity"]}["critical"] == 334
+    assert body["status"][0] == {"key": "new", "count": 1200}
+    assert body["outcome"][0] == {"key": "attempted", "count": 1000}
+    assert body["aggregations"]["severity"]["high"] == 900
     assert body["new_count"] == 1200
     assert body["critical_count"] == 334
     assert body["mitre"][0][0] == "T1110"

@@ -199,8 +199,10 @@ services:
       - PCAP_EXPORT_MAX_BYTES=${PCAP_EXPORT_MAX_BYTES:-2000000000}
       - PCAP_SESSION_BUFFER_MINUTES=${PCAP_SESSION_BUFFER_MINUTES:-5}
       - ARKIME_VIEWER_URL=${ARKIME_VIEWER_URL:-http://127.0.0.1:8005}
-      - ARKIME_PUBLIC_BASE=${ARKIME_PUBLIC_BASE:-}
+      # v0.16.0 SSO bake (req 13): shared secret + base publik viewer.
+      # Secret kosong = SSO off (proxy membalas 503, layanan tetap sehat).
       - ARKIME_PROXY_SECRET=${ARKIME_PROXY_SECRET:-}
+      - ARKIME_PUBLIC_BASE=${ARKIME_PUBLIC_BASE:-/backend/api/arkime}
       # TLS hardening (v0.12): Secure cookie + HSTS when served via HTTPS
       - TLS_ENABLED=${TLS_ENABLED:-0}
     volumes:
@@ -351,7 +353,11 @@ services:
       - OPENSEARCH_URL=http://127.0.0.1:${OPENSEARCH_HTTP_PORT}
       - ARKIME_FREESPACE_G=${ARKIME_FREESPACE_G:-40}
       - ARKIME_WEB_PORT=${ARKIME_WEB_PORT:-8005}
+      # v0.16.0 SSO bake (req 13): HARUS sama dengan env layanan API.
+      # webBasePath viewer dirender otomatis dari ARKIME_PUBLIC_BASE
+      # (trailing slash dijamin entrypoint) + header-auth block.
       - ARKIME_PROXY_SECRET=${ARKIME_PROXY_SECRET:-}
+      - ARKIME_PUBLIC_BASE=${ARKIME_PUBLIC_BASE:-/backend/api/arkime}
       - TZ=${TZ}
     volumes:
       - ${NDR_DATA_ROOT}/pcap:/opt/arkime/raw

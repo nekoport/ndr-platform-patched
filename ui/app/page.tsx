@@ -10,7 +10,8 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/hooks/use-toast";
 import {
-  Activity, BellRing, Dna, FileBarChart, FileCog, FlaskConical, Gauge, Globe2,
+  Activity, BellRing, Dice5, Dices, Dna, FileBarChart, FileCog, FlaskConical,
+  Gauge, Globe2,
   KeyRound, LayoutDashboard, LogOut, Network, Radar, ScrollText, Search,
   Server, Settings, ShieldCheck, UserCog, Users, Crosshair, Waypoints, Rss,
 } from "lucide-react";
@@ -21,6 +22,9 @@ import { AlertsView } from "@/components/ndr/alerts";
 import { AssetsView } from "@/components/ndr/assets";
 import { AuditView } from "@/components/ndr/audit";
 import { DgaView } from "@/components/ndr/dga";
+import { DnsExplorerView } from "@/components/ndr/dns-explorer";
+import { GamblingView } from "@/components/ndr/gambling-view";
+import { LiveTrafficWidget } from "@/components/ndr/live-traffic";
 import { EventsView } from "@/components/ndr/events";
 import { IncidentsView } from "@/components/ndr/incidents";
 import { LoginView } from "@/components/ndr/login";
@@ -48,7 +52,8 @@ import type {
 type View =
   | "overview" | "incidents" | "alerts" | "dga" | "threatintel" | "events"
   | "threatmap" | "topology" | "reports" | "sensors" | "audit"
-  | "rules" | "intelfeeds" | "assets" | "users" | "roles" | "settings";
+  | "rules" | "intelfeeds" | "assets" | "users" | "roles" | "settings"
+  | "dns" | "gambling"; // v0.16.0: DNS Explorer (req 7/9) + Judi Online (req 18)
 
 // v0.10 navigation: detection flow (Monitor/Detect/Investigate/Govern) is
 // separated from platform administration (Configuration). Detection results
@@ -64,7 +69,11 @@ const NAV: { id: View; label: string; icon: React.ElementType; group: string; ad
   // dns_nxdomain_burst alerts - no new detector)
   { id: "dga", label: "DGA Activity", icon: Dna, group: "Detect" },
   { id: "threatintel", label: "Threat Intel", icon: Crosshair, group: "Detect" },
+  // v0.16.0 (req 18): watchlist Judi Online
+  { id: "gambling", label: "Judi Online", icon: Dices, group: "Detect" },
   { id: "threatmap", label: "Threat Map", icon: Globe2, group: "Detect" },
+  // v0.16.0 (req 7): DNS Explorer - resolved/gagal + transaksi lengkap
+  { id: "dns", label: "DNS & TLS", icon: Globe2, group: "Investigate" },
   { id: "events", label: "Event Search", icon: Search, group: "Investigate" },
   { id: "topology", label: "Topology", icon: Network, group: "Investigate" },
   { id: "reports", label: "Reports", icon: FileBarChart, group: "Govern" },
@@ -454,6 +463,10 @@ export default function Home() {
                        }));
                      }} />
           )}
+          {/* v0.16.0 (req 7/9): DNS & TLS Explorer */}
+          {view === "dns" && <DnsExplorerView />}
+          {/* v0.16.0 (req 18): watchlist Judi Online */}
+          {view === "gambling" && <GamblingView />}
           {view === "threatintel" && (
             <ThreatIntelView data={tiData} loading={viewDataLoading}
                              canAdmin={canAdminTI}

@@ -17,11 +17,71 @@ from app.models import CommonEvent
 from app.detection.rules import (BeaconingDetector, IocMatchDetector,
                                  NXDomainBurstDetector, PortscanDetector,
                                  SuricataAlertGrouper)
-from app.detection.behavior import (DGADetector, DnsTunnelingDetector,
+from app.detection.behavior import (AuthBruteforceDetector, DGADetector,
+                                    DnsTunnelingDetector,
                                     FileTransferDetector,
+                                    GamblingAccessDetector,
                                     InternalLateralDetector,
                                     LargeOutboundDetector)
 from app.detection.allowlist import AlertAllowlistProvider
+
+
+class _AlertGeoTagger:
+    """v0.16.0 (requirement 12): tag geo pada doc alert - TERPUSAT.
+
+    Queue adapter antara DetectionEngine dan sink: dokumen alert
+    (punya 'alert_id') diberi geo_src/geo_dst {country, country_iso_code,
+    asn_org} dari GeoEnricher yang sama dengan event (thread-safe, skip
+    IP privat, lookup in-process). Dengan ini SEMUA alert - suricata
+    grouping, behaviour, ioc_match - kaya geo tanpa menyentuh 13+ caller
+    build_alert_doc (satu titik, nol duplikasi).
+
+    Desain diet indeks: peta tetap hidup dari geo_point di ndr-events;
+    alert cukup keyword country/iso/ASN utk tooltip & agregasi.
+    """
+
+    def __init__(self, inner, geo_enricher):
+        self._inner = inner
+        self._geo = geo_enricher
+
+    def _tag(self, doc: dict) -> None:
+        if "geo_src" in doc or "geo_dst" in doc:
+            return  # idempoten: tagger boleh dipasang dua kali saat test
+        for side, entity in (("src", "source"), ("dst", "destination")):
+            ip = (doc.get(entity) or {}).get("ip")
+            if not ip:
+                continue
+            try:
+                g = self._geo.lookup(ip) or {}
+            except Exception:  # noqa: BLE001 - geo never blocks detection
+                continue
+            flat = {k: g[k] for k in ("country", "country_iso_code", "asn_org")
+                    if g.get(k)}
+            if flat:
+                doc[f"geo_{side}"] = flat
+
+    # ---- queue adapter: BaseRule hanya memakai put(); passthrough sisanya
+    def put(self, item, *args, **kwargs):
+        try:
+            index, doc_id, doc = item
+            if isinstance(doc, dict) and "alert_id" in doc \
+                    and "ndr-alerts" in str(index):
+                self._tag(doc)
+        except Exception:  # noqa: BLE001 - forwarding MUST never fail
+            pass
+        return self._inner.put(item, *args, **kwargs)
+
+    def qsize(self) -> int:
+        return self._inner.qsize()
+
+    def empty(self) -> bool:
+        return self._inner.empty()
+
+    def join(self) -> None:
+        self._inner.join()
+
+    def task_done(self) -> None:
+        self._inner.task_done()
 
 
 def _alert_index_factory(base: str = "ndr-alerts"):
@@ -39,11 +99,17 @@ class DetectionEngine(threading.Thread):
 
     SWEEP_INTERVAL = 30.0
 
-    def __init__(self, cfg: Config, in_queue, out_queue):
+    def __init__(self, cfg: Config, in_queue, out_queue, geo_enricher=None):
         super().__init__(daemon=True, name="detection")
         self.cfg = cfg
         self.in_queue = in_queue
-        self.out_queue = out_queue
+        # v0.16.0 (req 12): bila geo enricher tersedia, doc alert kaya
+        # geo_src/geo_dst lewat adapter terpusat (lihat _AlertGeoTagger);
+        # tanpa geo, out_queue dipakai apa adanya - perilaku lama utuh.
+        if geo_enricher is not None:
+            self.out_queue = _AlertGeoTagger(out_queue, geo_enricher)
+        else:
+            self.out_queue = out_queue
         self._stop = threading.Event()
         self._recon_hook = None          # set via set_recon_hook()
         index_for = _alert_index_factory()
@@ -111,6 +177,27 @@ class DetectionEngine(threading.Thread):
             index_for_alert=index_for, zones=cfg.zones)
         self.rules += [self.file_transfer, self.dga, self.tunnel,
                        self.lateral, self.outbound]
+
+        # ---- v0.16.0: bruteforce (req 1/3) + gambling watchlist (req 18)
+        # getattr + fallback: config stub di test tanpa field baru tetap jalan
+        self.bruteforce: AuthBruteforceDetector | None = None
+        if getattr(cfg, "detect_bruteforce_enabled", True):
+            self.bruteforce = AuthBruteforceDetector(
+                min_failures=getattr(cfg, "detect_bruteforce_min_failures", 20),
+                window_min=getattr(cfg, "detect_bruteforce_window_min", 10),
+                max_keys=cfg.detect_max_tracked_keys,
+                sensor_id=cfg.sensor_id, sink_queue=self.out_queue,
+                index_for_alert=index_for)
+            self.rules.append(self.bruteforce)
+        self.gambling: GamblingAccessDetector | None = None
+        if getattr(cfg, "detect_gambling", True):
+            self.gambling = GamblingAccessDetector(
+                min_hits=getattr(cfg, "detect_gambling_min_hits", 3),
+                window_min=getattr(cfg, "detect_gambling_window_min", 10),
+                max_keys=cfg.detect_max_tracked_keys,
+                sensor_id=cfg.sensor_id, sink_queue=self.out_queue,
+                index_for_alert=index_for)
+            self.rules.append(self.gambling)
 
         self.ioc_match: IocMatchDetector | None = None
         if cfg.detect_ioc_match:
@@ -208,6 +295,11 @@ class DetectionEngine(threading.Thread):
                 self.tunnel.feed(ev, index_name)
             elif ev.event_type == "fileinfo":
                 self.file_transfer.feed(ev, index_name)
+            elif ev.event_type == "http":
+                if self.bruteforce is not None:
+                    self.bruteforce.feed(ev, index_name)
+            if self.gambling is not None and ev.campaign:
+                self.gambling.feed(ev, index_name)
             if self.ioc_match is not None and ev.matched_ioc:
                 self.ioc_match.feed(ev, index_name)
         except Exception:  # noqa: BLE001 - detection must not die, but the

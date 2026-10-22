@@ -33,7 +33,7 @@ export function LoginView({ onLogin, demo }: {
             <ShieldCheck className="h-6 w-6 text-emerald-400" />
           </div>
           <h1 className="text-xl font-semibold tracking-tight text-zinc-100">NDR Console</h1>
-          <p className="text-sm text-zinc-500">Network Detection &amp; Response - Phase 0-2</p>
+          <p className="text-sm text-zinc-500">Network Detection &amp; Response</p>
         </div>
 
         <Card className="border-zinc-800 bg-zinc-900/70">

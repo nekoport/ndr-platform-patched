@@ -3,6 +3,7 @@
 Endpoints:
   GET  /api/rules/summary         counts, categories, sensor state (view)
   GET  /api/rules                 rule list + 7d hit counts (view)
+  GET  /api/rules/stats           hit statistics 24h/7d (req 14/15, view)
   POST /api/rules/update          regenerate rules + live reload (rule_admin)
   POST /api/rules/{sid}/toggle    enable/disable one rule (rule_admin)
   POST /api/rules/validate        syntax-check one rule text (rule_admin)
@@ -24,6 +25,7 @@ Every mutation is audited with before/after detail.
 from __future__ import annotations
 
 import os
+import socket
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -36,8 +38,9 @@ from app import rules_engine as re_mod
 from app.audit import audit
 from app.config import config
 from app.db import get_db, SessionLocal
-from app.models import CustomRule, SuricataRuleMeta, User
+from app.models import CustomRule, RuleStat, SuricataRuleMeta, User
 from app.os_client import get_os
+from app import rule_stats as rs_mod
 from app.schemas import (CustomRuleCreate, CustomRuleOut, CustomRuleUpdate,
                          RuleToggle)
 from app.security import require_permission
@@ -284,6 +287,41 @@ def _hit_counts(sids: list[int]) -> dict[int, int]:
         return {}
 
 
+@router.get("/status")
+def rules_status(user: User = Depends(require_permission("view"))):
+    """v0.16.1 (P1-3): status ruleset + sensor TANPA parsing 45 MB.
+
+    Endpoint ringan (hanya stat/exists) untuk KPI Rule Manager dan
+    diagnosa deploy: menampilkan path PERSIS yang dilihat container API
+    sehingga perbedaan mount API-vs-UI langsung terlihat. UI memakai
+    endpoint ini sebagai sumber kebenaran kartu file/sensor.
+    """
+    path = re_mod.rules_path()
+    socket_path = config.suricata_unix_socket
+    exists = os.path.exists(path)
+    return {
+        "rules_file": path,
+        "rules_dir": config.rules_dir,
+        "rules_file_exists": exists,
+        "rules_file_updated": re_mod.file_mtime(),
+        "rules_file_size": os.path.getsize(path) if exists else None,
+        "disable_conf": re_mod.disable_path(),
+        "disable_conf_exists": os.path.exists(re_mod.disable_path()),
+        "suricata_conf": config.suricata_conf,
+        "suricata_conf_exists": os.path.exists(config.suricata_conf),
+        "unix_socket": socket_path,
+        "socket_present": os.path.exists(socket_path),
+        "sensor_online": re_mod.sensor_online(),
+        "cache_warm": _ITEMS_CACHE is not None,
+        "cached_rules": len(_ITEMS_CACHE) if _ITEMS_CACHE is not None else 0,
+        "zeek_local_conf": config.zeek_local_conf,
+        "zeek_local_exists": os.path.exists(config.zeek_local_conf),
+        "container": socket.gethostname(),
+        "note": "kalau rules_file_exists=false padahal file ada di host, "
+                "cek mount ./sensor/suricata/rules di service ndr-api",
+    }
+
+
 @router.get("/summary")
 def rules_summary(user: User = Depends(require_permission("view")),
                   db: Session = Depends(get_db)):
@@ -349,11 +387,75 @@ def list_rules(q: str | None = Query(default=None, max_length=128),
                  if (it.get("source") or "suricata") == source]
     total = len(items)
     page = items[offset:offset + limit]
-    hits = _hit_counts([it["sid"] for it in page])
+    # v0.16.0 (req 14/15): hits dari tabel rule_stats (murah, sudah
+    # di-refresh background); fallback on-the-fly 7d bila tabel kosong
+    # (baru pasang / refresher off).
+    stats = {s.rule_key: s for s in
+             db.query(RuleStat).filter(
+                 RuleStat.rule_key.in_([str(it["sid"]) for it in page]))
+             .all()}
+    if stats:
+        hits = {int(k): v.hits_7d for k, v in stats.items()
+                if k.isdigit()}
+    else:
+        hits = _hit_counts([it["sid"] for it in page])
+
+    def _stat(sid: int) -> dict:
+        s = stats.get(str(sid))
+        if s is None:
+            return {"hits_24h": None, "hits_7d": hits.get(sid, 0),
+                    "sev_max": None, "last_hit_at": None}
+        return {"hits_24h": s.hits_24h, "hits_7d": s.hits_7d,
+                "sev_max": s.sev_max,
+                "last_hit_at": s.last_hit_at.isoformat()
+                if s.last_hit_at else None}
+
     return {"total": total, "skipped_lines": data["skipped"],
             "rules_file_updated": re_mod.file_mtime(),
-            "items": [{**it, "hits_7d": hits.get(it["sid"], 0)}
+            "stats_available": bool(stats),
+            "items": [{**it, "hits_7d": hits.get(it["sid"], 0),
+                       **_stat(it["sid"])}
                       for it in page]}
+
+
+# --------------------------------------------------- rule stats (v0.16.0)
+@router.get("/stats")
+def rule_stats_endpoint(
+        refresh: bool = Query(default=False),
+        user: User = Depends(require_permission("view")),
+        db: Session = Depends(get_db)):
+    """Statistik hit per rule (requirement 15).
+
+    Sumber = tabel rule_stats (diisi RuleStatsRefresher tiap
+    RULE_STATS_REFRESH_MIN menit). `?refresh=1` memicu agregasi
+    langsung (untuk UAT/demo tanpa menunggu siklus).
+    """
+    if refresh:
+        try:
+            rs_mod.refresh_rule_stats(db)
+        except Exception as e:  # noqa: BLE001 - degrade jujur
+            raise HTTPException(502, f"stats refresh failed: {e}")
+    rows = (db.query(RuleStat)
+            .order_by(RuleStat.hits_7d.desc())
+            .limit(500).all())
+    noisy = sum(1 for r in rows if (r.hits_7d or 0) > 1000)
+    return {
+        "updated_at": max((r.updated_at for r in rows),
+                          default=None).isoformat()
+        if rows else None,
+        "total": len(rows),
+        "noisy": noisy,
+        "items": [{
+            "rule_key": r.rule_key, "source": r.source,
+            "signature": r.signature,
+            "hits_24h": r.hits_24h, "hits_7d": r.hits_7d,
+            "sev_max": r.sev_max,
+            "last_hit_at": r.last_hit_at.isoformat()
+            if r.last_hit_at else None,
+            "sample_alert_id": r.sample_alert_id,
+            "noisy": (r.hits_7d or 0) > 1000,
+        } for r in rows],
+    }
 
 
 # ------------------------------------------- zeek script view (v0.12.7)

@@ -70,6 +70,22 @@ export interface AlertDoc {
   source_asset_name?: string | null;
   /** Hostname of the registered/known asset when destination IP matches the asset inventory. */
   destination_asset_name?: string | null;
+  // ---------------------------------------------------------------- v0.16.0
+  /** req 3: status keberhasilan serangan (kosakata tender). */
+  attack_status?: string;
+  /** req 8: skor DGA ternormalisasi 0-100 (dga_suspected). */
+  dga_score?: number;
+  /** req 18: campaign tag watchlist (mis. "judi-online"). */
+  campaign?: string;
+  /** req 10: CVE diekstrak dari signature/reason. */
+  cve?: string[];
+  /** req 13: penjelasan display-only (index:false di template). */
+  explanation?: string;
+  /** req 12: geo/ASN sumber & tujuan (GeoIP enrichment pipeline). */
+  geo_src?: { country?: string; country_iso_code?: string;
+              asn_org?: string };
+  geo_dst?: { country?: string; country_iso_code?: string;
+              asn_org?: string };
 }
 
 export interface EventDoc {
@@ -858,6 +874,11 @@ export interface RuleRow {
   changed_by: string | null;
   changed_at: string | null;
   hits_7d?: number;
+  // v0.16.0 (req 14/15): rule hit statistics dari tabel rule_stats
+  hits_24h?: number | null;
+  sev_max?: string | null;
+  last_hit_at?: string | null;
+  noisy?: boolean;
   // v0.12.7 rule-source taxonomy: local = operator-authored,
   // suricata = subscribed ET ruleset (zeek is a separate endpoint)
   source?: "local" | "suricata";
@@ -885,10 +906,34 @@ export interface RulesSummary {
   update_tool: string;
 }
 
+// v0.16.1 (P1-3): status ruleset/sensor TANPA parsing - sumber KPI
+export interface RulesStatus {
+  rules_file: string;
+  rules_dir?: string;
+  rules_file_exists: boolean;
+  rules_file_updated: string | null;
+  rules_file_size?: number | null;
+  disable_conf?: string;
+  disable_conf_exists?: boolean;
+  suricata_conf?: string;
+  suricata_conf_exists?: boolean;
+  unix_socket: string;
+  socket_present: boolean;
+  sensor_online: boolean;
+  cache_warm?: boolean;
+  cached_rules?: number;
+  zeek_local_conf?: string;
+  zeek_local_exists?: boolean;
+  container?: string;
+  note?: string;
+}
+
 export interface RulesList {
   total: number;
   skipped_lines: number;
   rules_file_updated: string | null;
+  // v0.16.0: true bila tabel rule_stats terisi (join berhasil)
+  stats_available?: boolean;
   items: RuleRow[];
 }
 
@@ -902,9 +947,20 @@ export interface AlertStatBucket {
 export interface AlertStats {
   total: number;
   relation?: string;
+  // v0.16.0 (bug A6 fix): kontrak UI = LIST {key,count}; bentuk dict
+  // vendor lama tetap tersedia di bawah aggregations.
   severity: AlertStatBucket[];
   status: AlertStatBucket[];
   outcome: AlertStatBucket[];
+  attack_status?: AlertStatBucket[];
+  kill_chain?: AlertStatBucket[];
+  aggregations?: {
+    severity: Record<string, number>;
+    status: Record<string, number>;
+    outcome: Record<string, number>;
+    attack_status?: Record<string, number>;
+    kill_chain?: Record<string, number>;
+  };
 }
 
 // v0.12.8: DGA Activity focus view - aggregation-only summary over the
@@ -1240,4 +1296,123 @@ export interface AllowSummary {
   top: { id: number; alert_type: string; entity_field: AllowEntityField;
          entity_value: string; layer: AllowLayer; hit_count: number;
          last_hit_at?: string | null }[];
+}
+
+// ==================================================================== v0.16.0
+// R5: filter DSL AST (and/or/not + is/is_one/include/exclude/cidr/range)
+export type FilterOp =
+  | "is" | "is_one" | "include" | "exclude"
+  | "gt" | "gte" | "lt" | "lte" | "cidr";
+
+export interface FilterLeaf {
+  field: string;
+  op: FilterOp;
+  value: string | number | (string | number)[];
+}
+
+export interface FilterGroup {
+  and?: (FilterGroup | FilterLeaf)[];
+  or?: (FilterGroup | FilterLeaf)[];
+  not?: FilterGroup | FilterLeaf;
+}
+
+export type FilterAst = FilterGroup | FilterLeaf;
+
+// R6: export alert body
+export interface ExportAlertBody {
+  format: "csv" | "xlsx";
+  time_from: string;
+  time_to: string;
+  filter?: FilterAst;
+  query?: Record<string, unknown>;
+  columns?: string[];
+  max_rows?: number;
+}
+
+// R7: DNS explorer
+export interface DnsSummary {
+  hours: number;
+  total: number;
+  // v0.16.1 (P1-4): penyebut rasio = dokumen dengan dns.rcode (response)
+  // - eksak, bukan lagi hits.total yang ter-cap 10.000 (bug rasio 9133%)
+  transactions: number;
+  resolved: number;
+  unresolved: number;
+  no_response?: number;
+  resolved_pct: number;
+  rcodes: { key: string; count: number; pct?: number }[];
+  top_queried: { domain: string; count: number }[];
+  top_clients: { ip: string; count: number }[];
+}
+
+export interface DnsHit {
+  id: string;
+  "@timestamp": string | null;
+  client: string | null;
+  server: string | null;
+  query: string | null;
+  qtype: string | null;
+  rcode: string | null;
+  resolved: boolean;
+  answer_count: number;
+  answers: unknown[];
+  campaign?: string | null;
+}
+
+// R9: TLS insights (metadata-only)
+export interface TlsSummary {
+  hours: number;
+  total: number;
+  capped_total?: number;
+  sources?: string[];
+  versions: { key: string; count: number }[];
+  top_ja3: { key: string; count: number }[];
+  top_sni: { key: string; count: number }[];
+  issuers: { key: string; count: number }[];
+}
+
+// R18: Judi Online watchlist view
+export interface GamblingSummary {
+  hours: number;
+  campaign: string;
+  total_events: number;
+  top_clients: { key: string; count: number }[];
+  top_domains: { key: string; count: number }[];
+  top_hosts: { key: string; count: number }[];
+  by_engine: { key: string; count: number }[];
+  timeline_hourly: { ts: string; count: number }[];
+  keywords: string[];
+  note: string;
+}
+
+// R14+15: rule hit statistics
+export interface RuleStatRow {
+  rule_key: string;
+  source: string;
+  signature?: string | null;
+  hits_24h: number;
+  hits_7d: number;
+  sev_max?: string | null;
+  last_hit_at?: string | null;
+  sample_alert_id?: string | null;
+  noisy?: boolean;
+}
+
+export interface RuleStatsList {
+  updated_at?: string | null;
+  total: number;
+  noisy: number;
+  items: RuleStatRow[];
+}
+
+// R19: one SSE tick of /api/metrics/live
+export interface LiveMetricTick {
+  ts: string;
+  eps?: number | null;
+  eps_by_engine?: Record<string, number>;
+  queue_depth?: number | null;
+  queue_capacity?: number | null;
+  backlog_seconds?: number | null;
+  alerts_5m?: number | null;
+  events_5m?: number | null;
 }

@@ -3,13 +3,21 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.audit import audit
+from app.config import config
 from app.db import get_db
+from app.filters import (ALERT_FILTER_FIELDS, FilterError, build_query,
+                         combine)
 from app.graph import MergedGraph, is_internal_ip, prune_relationship_payload
 from app.killchain import phase_for_stage
 from app.models import (Incident, IncidentEdge, IncidentEvidence,
@@ -39,10 +47,15 @@ def search_alerts(body: SearchRequest, request: Request,
     if body.index != "ndr-alerts-read":
         body.index = "ndr-alerts-read"
     try:
+        # v0.16.0 (req 5): custom filter DSL digabung dengan query lama
+        filter_query = build_query(body.filter, ALERT_FILTER_FIELDS)
+        combined = combine(body.query or None, filter_query)
         result = get_os().guarded_search(
-            alias=body.index, query=body.query, size=body.size,
+            alias=body.index, query=combined, size=body.size,
             from_=body.from_, sort=body.sort,
             time_from=body.time_from, time_to=body.time_to)
+    except FilterError as e:
+        raise HTTPException(400, f"Filter rejected: {e}")
     except DSLValidationError as e:
         raise HTTPException(400, f"Query rejected: {e}")
     except Exception as e:
@@ -77,6 +90,14 @@ def search_alerts(body: SearchRequest, request: Request,
             "relation": total.get("relation", "eq"), "hits": hits}
 
 
+# v0.16.1 (P2-6): GET /api/alerts/search tadinya jatuh ke route
+# /{alert_id} (alert_id="search") lalu 502. Sekarang eksplisit 405
+# dengan petunjuk method yang benar.
+@router.get("/search")
+def alerts_search_wrong_method():
+    raise HTTPException(405, "Gunakan POST /api/alerts/search")
+
+
 @router.post("/stats")
 def alert_stats(body: SearchRequest, request: Request,
                 user: User = Depends(require_permission("search")),
@@ -93,17 +114,22 @@ def alert_stats(body: SearchRequest, request: Request,
     if body.index != "ndr-alerts-read":
         body.index = "ndr-alerts-read"
     os = get_os()
-    aggs = {
-        "by_severity": {"terms": {"field": "severity", "size": 8}},
-        "by_status": {"terms": {"field": "status", "size": 10}},
-        "by_outcome": {"terms": {"field": "outcome", "size": 8}},
-        "by_mitre": {"terms": {"field": "mitre.technique_id", "size": 12}},
-    }
     try:
-        if body.query:
-            os.validate_query(body.query)
+        # v0.16.0 (req 5): filter DSL ikut berlaku pada agregasi header
+        filter_query = build_query(body.filter, ALERT_FILTER_FIELDS)
+        combined = combine(body.query or None, filter_query)
+        aggs = {
+            "by_severity": {"terms": {"field": "severity", "size": 8}},
+            "by_status": {"terms": {"field": "status", "size": 10}},
+            "by_outcome": {"terms": {"field": "outcome", "size": 8}},
+            "by_attack_status": {"terms": {"field": "attack_status", "size": 8}},
+            "by_kill_chain": {"terms": {"field": "kill_chain.stage", "size": 10}},
+            "by_mitre": {"terms": {"field": "mitre.technique_id", "size": 12}},
+        }
+        if combined:
+            os.validate_query(combined)
         time_filter = os.build_time_filter(body.time_from, body.time_to)
-        filters = [time_filter] + ([body.query] if body.query else [])
+        filters = [time_filter] + ([combined] if combined else [])
         result = os.aggregate(alias=body.index, body={
             "size": 0,
             "track_total_hits": 10000,
@@ -113,9 +139,11 @@ def alert_stats(body: SearchRequest, request: Request,
     except DSLValidationError as e:
         raise HTTPException(400, f"Query rejected: {e}")
     except Exception as e:  # noqa: BLE001 - degrade, never 500 the header
-        return {"total": 0, "relation": "eq", "severity": {}, "status": {},
-                "outcome": {}, "new_count": 0, "critical_count": 0,
+        return {"total": 0, "relation": "eq", "severity": [], "status": [],
+                "outcome": [], "attack_status": [], "kill_chain": [],
+                "new_count": 0, "critical_count": 0,
                 "mitre": [], "scatter": [], "sample_size": 0,
+                "aggregations": {},
                 "note": f"stats unavailable: {e}"}
 
     def bucket_dict(name: str) -> dict:
@@ -123,9 +151,21 @@ def alert_stats(body: SearchRequest, request: Request,
                 for b in result.get("aggregations", {})
                 .get(name, {}).get("buckets", [])}
 
+    def bucket_list(name: str) -> list[dict]:
+        """v0.16.0 (bug A6 fix): kontrak UI mengharapkan LIST {key,count}
+        (AlertStatBucket[]); bentuk dict vendor 0.15.0 dipindah ke key
+        'aggregations.*' agar dua generasi kontrak aman berdampingan.
+        Urutan: count desc - sama seperti normalisasi live 2026-10-20.
+        """
+        buckets = [{"key": k, "count": c}
+                   for k, c in bucket_dict(name).items()]
+        return sorted(buckets, key=lambda b: -b["count"])
+
     severity = bucket_dict("by_severity")
     status = bucket_dict("by_status")
     outcome = bucket_dict("by_outcome")
+    attack_status = bucket_dict("by_attack_status")
+    kill_chain = bucket_dict("by_kill_chain")
     mitre_buckets = [(b.get("key"), b.get("doc_count", 0))
                      for b in result.get("aggregations", {})
                      .get("by_mitre", {}).get("buckets", [])]
@@ -135,7 +175,7 @@ def alert_stats(body: SearchRequest, request: Request,
     names: dict[str, str] = {}
     try:
         sres = os.guarded_search(
-            alias=body.index, query=body.query, size=300, from_=0,
+            alias=body.index, query=combined, size=300, from_=0,
             sort=[{"last_seen": {"order": "desc"}}],
             time_from=body.time_from, time_to=body.time_to)
         for h in sres["hits"]["hits"]:
@@ -159,30 +199,25 @@ def alert_stats(body: SearchRequest, request: Request,
     total = result["hits"]["total"]
     audit(db, request, action="alerts.stats", target_type="index",
           target_id="ndr-alerts-read", actor=user)
-    # UI contract (AlertStatBucket[]): severity/status/outcome are lists of
-    # {key,count}. v0.15.0 shipped these as aggregates dicts which crashed
-    # the Alert Center charts (e.map is not a function) - normalize here AND
-    # keep the convenience keys (new_count/critical_count/mitre/scatter) the
-    # dicts fed before, so both contract generations keep working.
-    def bucket_list(name: str, d: dict) -> list[dict]:
-        base = bucket_dict(name)
-        items = [{"key": k, "count": v} for k, v in (d or {}).items()]
-        items.sort(key=lambda i: (-i["count"], i["key"]))
-        return items
-
     return {"total": total.get("value", 0),
             "relation": total.get("relation", "eq"),
-            "severity": bucket_list("by_severity", severity),
-            "status": bucket_list("by_status", status),
-            "outcome": bucket_list("by_outcome", outcome),
-            "aggregations": {"severity": severity, "status": status,
-                             "outcome": outcome},
+            # list {key,count} - kontrak UI (bug A6 fix)
+            "severity": bucket_list("by_severity"),
+            "status": bucket_list("by_status"),
+            "outcome": bucket_list("by_outcome"),
+            "attack_status": bucket_list("by_attack_status"),
+            "kill_chain": bucket_list("by_kill_chain"),
             "new_count": status.get("new", 0),
             "critical_count": severity.get("critical", 0),
             "mitre": [[tid, names.get(tid, tid), cnt]
                       for tid, cnt in mitre_buckets],
             "scatter": scatter,
-            "sample_size": len(scatter)}
+            "sample_size": len(scatter),
+            # bentuk dict vendor 0.15.0 tetap tersedia di sini
+            "aggregations": {"severity": severity, "status": status,
+                             "outcome": outcome,
+                             "attack_status": attack_status,
+                             "kill_chain": kill_chain}}
 
 
 # ------------------------------------------- DGA focus view (v0.12.8)
@@ -699,3 +734,192 @@ def escalate_alert(alert_id: str, body: EscalateRequest, request: Request,
           detail={"alert_id": alert_id, "reason": body.reason or None})
     return {"incident_id": incident_id,
             "title": incident.title}
+
+
+# ------------------------------------------- Alert export (v0.16.0, req 6)
+EXPORT_COLUMNS = [
+    "alert_id", "@timestamp", "first_seen", "last_seen", "severity",
+    "status", "attack_status", "outcome", "kill_chain.stage",
+    "detection_engine", "alert_type", "title", "source.ip",
+    "destination.ip", "network.protocol", "network.transport",
+    "event_count", "campaign", "cve", "dns_domains",
+    "top_rules.signature", "mitre.techniques", "explanation",
+]
+
+
+class ExportRequest(BaseModel):
+    """Body export alert (req 6). Query/filter sama dengan /search."""
+    format: str = "csv"  # csv | xlsx
+    query: dict[str, Any] = Field(default_factory=dict)
+    filter: dict[str, Any] | None = None
+    time_from: str | None = None
+    time_to: str | None = None
+    columns: list[str] | None = None
+    max_rows: int = Field(default=50000, ge=1, le=200000)
+
+    model_config = {"populate_by_name": True}
+
+
+def _flatten(value: Any) -> str:
+    """Nilai nested/list -> sel tunggal yang terbaca di csv/xlsx."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        if "stage" in value and value.get("stage") is not None:
+            return str(value["stage"])
+        if "ip" in value:
+            return str(value["ip"])
+        if "technique_id" in value:
+            return str(value["technique_id"])
+        if "signature" in value:
+            return str(value["signature"])
+        return "; ".join(f"{k}={_flatten(v)}" for k, v in value.items())
+    if isinstance(value, list):
+        return "; ".join(_flatten(v) for v in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _cell(doc: dict, column: str) -> Any:
+    # v0.16.0: kolom rollup ditangani SEBELUM traversal dot (list tidak
+    # bisa di-walk pakai dict.get - dulu selalu return kosong).
+    if column == "mitre.techniques":
+        mitre = doc.get("mitre") or []
+        if isinstance(mitre, list):
+            return "; ".join(
+                sorted({str(m.get("technique_id"))
+                        for m in mitre if isinstance(m, dict)}))
+    if column == "top_rules.signature":
+        rules = doc.get("top_rules") or []
+        if isinstance(rules, list):
+            return "; ".join(
+                sorted({str(r.get("signature"))
+                        for r in rules if isinstance(r, dict)}))
+    cur: Any = doc
+    for part in column.split("."):
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(part)
+    if isinstance(cur, (dict, list)):
+        return _flatten(cur)
+    return cur
+
+
+@router.post("/export")
+def export_alerts(body: ExportRequest, request: Request,
+                  user: User = Depends(require_permission("search")),
+                  db: Session = Depends(get_db)):
+    """Export alert ke .csv / .xlsx (requirement 6).
+
+    Streaming dengan search_after pagination (bukan from+size, aman untuk
+    hasil besar), window time WAJIB (guard yang sama dengan /search),
+    baris di-cap config.export_max_rows. File dibangun di memori dengan
+    batas baris; audit mencatat setiap permintaan export.
+    """
+    fmt = (body.format or "csv").lower()
+    if fmt not in ("csv", "xlsx"):
+        raise HTTPException(400, "format must be csv or xlsx")
+    columns = body.columns or EXPORT_COLUMNS
+    # v0.16.0: whitelist PENUH - kolom harus exact EXPORT_COLUMNS atau
+    # dot-prefixed di bawah root yang sama (menutup celah kolom tanpa
+    # titik seperti 'raw_event' yang dulu lolos ke backend).
+    allowed_exact = set(EXPORT_COLUMNS)
+    allowed_roots = {c.split(".")[0] for c in EXPORT_COLUMNS}
+    bad = [c for c in columns
+           if not isinstance(c, str)
+           or (c not in allowed_exact
+               and ("." not in c or c.split(".")[0] not in allowed_roots))]
+    if bad:
+        raise HTTPException(400, f"unknown columns: {bad[:5]}")
+
+    os = get_os()
+    try:
+        filter_query = build_query(body.filter, ALERT_FILTER_FIELDS)
+        combined = combine(body.query or None, filter_query)
+        alias = os.validate_alias("ndr-alerts-read")
+        if combined:
+            os.validate_query(combined)
+        time_filter = os.build_time_filter(body.time_from, body.time_to)
+        filters = [time_filter] + ([combined] if combined else [])
+    except FilterError as e:
+        raise HTTPException(400, f"Filter rejected: {e}")
+    except DSLValidationError as e:
+        raise HTTPException(400, f"Query rejected: {e}")
+
+    audit(db, request, action="alerts.export", target_type="index",
+          target_id="ndr-alerts-read", actor=user,
+          detail={"format": fmt, "max_rows": body.max_rows})
+
+    batch_size = 1000
+    cap = min(body.max_rows, config.export_max_rows)
+    search_body: dict[str, Any] = {
+        "size": batch_size,
+        "track_total_hits": False,
+        "query": {"bool": {"filter": filters}},
+        "sort": [{"@timestamp": {"order": "desc"}},
+                 {"alert_id": {"order": "asc"}}],
+        "_source": {"excludes": ["raw_line"]},
+    }
+
+    rows: list[list[Any]] = []
+    after: Any = None
+    try:
+        while len(rows) < cap:
+            body_page = dict(search_body)
+            if after is not None:
+                body_page["search_after"] = after
+            page = os.client.search(index=alias, body=body_page,
+                                    request_timeout=30)
+            hits = (page.get("hits") or {}).get("hits") or []
+            if not hits:
+                break
+            for h in hits:
+                rows.append([_cell(h.get("_source") or {}, c)
+                             for c in columns])
+            after = hits[-1].get("sort")
+            if after is None:
+                break
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"Export backend unavailable: {e}")
+    rows = rows[:cap]
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        data = buf.getvalue().encode("utf-8-sig")
+        media = "text/csv; charset=utf-8"
+        filename = f"ndr-alerts-{stamp}.csv"
+    else:
+        # v0.16.1 (P0-1): import openpyxl LAZY di titik pakai. Import
+        # top-level dulu bikin SELURUH API crash saat dependency tidak
+        # terpasang (fresh deploy tanpa openpyxl = platform mati total).
+        # Kini: API tetap hidup, export xlsx saja yang menjawab 503.
+        try:
+            from openpyxl import Workbook  # noqa: deferred import
+        except ModuleNotFoundError as exc:
+            raise HTTPException(
+                503, "Export XLSX tidak tersedia: dependency 'openpyxl' "
+                     f"belum terpasang di image API ({exc}). Jalankan "
+                     "'pip install -r api/requirements.txt' atau pakai "
+                     "format csv.")
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("alerts")
+        ws.append(columns)
+        for r in rows:
+            ws.append([c if isinstance(c, (int, float)) else str(c)
+                       for c in r])
+        bio = io.BytesIO()
+        wb.save(bio)
+        data = bio.getvalue()
+        media = ("application/vnd.openxmlformats-officedocument"
+                 ".spreadsheetml.sheet")
+        filename = f"ndr-alerts-{stamp}.xlsx"
+
+    return StreamingResponse(
+        io.BytesIO(data), media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "X-Export-Rows": str(len(rows))})

@@ -370,6 +370,24 @@ CREATE TABLE IF NOT EXISTS suricata_rule_meta (
 CREATE INDEX IF NOT EXISTS idx_rule_meta_enabled ON suricata_rule_meta (enabled);
 CREATE INDEX IF NOT EXISTS idx_rule_meta_class   ON suricata_rule_meta (classtype);
 
+-- ---------------------- Rule hit statistics (v0.16.0, req 14+15) ------
+-- Populated by the API background refresher (RULE_STATS_REFRESH_MIN,
+-- default 15 minutes) from ndr-alerts aggregations; joined by the
+-- Rules Manager for the Hits 24h/7d columns and the stats endpoint.
+-- rule_key: numeric SID (suricata) or alert_type (zeek/pipeline).
+CREATE TABLE IF NOT EXISTS rule_stats (
+    rule_key        VARCHAR(128) PRIMARY KEY,
+    source          VARCHAR(16)  NOT NULL DEFAULT 'suricata',
+    signature       TEXT,
+    hits_24h        BIGINT       NOT NULL DEFAULT 0,
+    hits_7d         BIGINT       NOT NULL DEFAULT 0,
+    sev_max         VARCHAR(16),
+    last_hit_at     TIMESTAMPTZ,
+    sample_alert_id VARCHAR(64),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rule_stats_hits7d ON rule_stats (hits_7d DESC);
+
 -- ---------- PCAP & Evidence Workflow (doc section 15) ------------
 -- Chain of custody for selective PCAP exports: actor, reason, scope,
 -- bundle hash and TTL lifecycle (doc 15.3 + AT-19).

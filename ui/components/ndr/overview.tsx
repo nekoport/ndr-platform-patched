@@ -22,6 +22,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { LiveTrafficWidget } from "./live-traffic";
 import { DEMO_MODE, demoNewFeedItem, demoTickEps } from "@/lib/ndr/api";
 import type { FeedEvent, RichOverview } from "@/lib/ndr/types";
 import { cn } from "@/lib/utils";
@@ -271,6 +272,10 @@ export function OverviewView({ rich, loading, onOpenAlerts, loadError, onRetry }
                : "loading..."}
              icon={<ShieldCheck className="h-3.5 w-3.5" />} tone="ok" />
       </div>
+
+      {/* v0.16.0 (req 19): grafik trafik realtime SSE - pps-like EPS,
+          alert/event rate 5 menit, antrean pipeline (tick 2 detik) */}
+      <LiveTrafficWidget />
 
       {/* live EPS + severity */}
       <div className="grid gap-4 lg:grid-cols-3">

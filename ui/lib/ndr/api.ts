@@ -30,10 +30,12 @@ import type { AllowEntry, AllowStatus, AllowSummary, AllowLayer, AllowEntityFiel
   PcapCoverage, PcapExportCreate, PcapExportRecord, PcapExportsList,
   RegisteredAsset, RelatedIncident, RichOverview, Role,
   RoleMatrix, RuleRow, RuleToggleResult,
-  RuleValidateResult, RulesList, RulesSummary, RulesUpdateResult,
+  RuleValidateResult, RulesList, RulesStatus, RulesSummary, RulesUpdateResult,
   SessionUser, SensorRow, SystemSettings, TIFeed,
-  TIJob, ThreatIntelData, TIOverview, UserRow, ZeekScriptList,
+  TIJob, ThreatIntelData, TIOverview, TopItem, UserRow, ZeekScriptList,
   GraphCampaign, GraphEdge, GraphNode,
+  DnsHit, DnsSummary, ExportAlertBody, FilterAst, GamblingSummary,
+  RuleStatsList, ServiceMetric, TlsSummary,
 } from "./types";
 
 export interface SearchFilters {
@@ -43,6 +45,10 @@ export interface SearchFilters {
   time_from?: string;
   time_to?: string;
   size?: number;
+  /** v0.16.1 (P2-4): minta total eksak tanpa cap 10.000 */
+  exact_total?: boolean;
+  from?: number;
+  sort?: unknown;
 }
 
 export const API_BASE = "/backend";
@@ -160,11 +166,25 @@ export async function getRichOverview(): Promise<RichOverview> {
     fetchEventsTimeline(24).catch(() => ({ points: [] as {
       ts: string; count: number; engines?: Record<string, number> }[] })),
   ]);
+  // v0.16.1 (P1-2): Dashboard/Topology/Assets/Reports kini dibekali data
+  // agregasi NYATA dari /api/stats/overview (hosts, zone_traffic,
+  // protocols, top_dns/http/tls/ports, mttr, pipeline components).
+  // Dulu semuanya kosong karena tidak pernah dipetakan dari backend.
+  const s = stats as OverviewStats & Record<string, unknown>;
+  const richHosts = (s.hosts ?? []) as unknown as RichOverview["hosts"];
+  const pipelineComponents = ((health as Health & { pipeline?:
+    { components?: { name: string; ok: boolean; detail?: string }[] } })
+    .pipeline?.components) ?? [];
+  const services: ServiceMetric[] = pipelineComponents.map((c) => ({
+    name: c.name, ok: !!c.ok, detail: c.detail ?? "",
+    cpu_pct: 0, mem_pct: 0, uptime_days: 0, cpu_history: [],
+  }));
   return {
     generated_at: health.time,
     health,
     stats,
-    hosts: [], externals: [], flows: [],
+    hosts: richHosts,
+    externals: [], flows: [],
     timeline: (timeline.points ?? []).map((p) => ({
       ts: p.ts,
       zeek: Math.round(p.engines?.zeek ?? 0),
@@ -174,14 +194,23 @@ export async function getRichOverview(): Promise<RichOverview> {
       alerts_critical: 0, alerts_high: 0, alerts_medium: 0, alerts_low: 0,
     })),
     alert_heatmap: [],
-    top_internal_talkers: [],
+    top_internal_talkers: richHosts.slice(0, 8).map((h) => ({
+      key: String(h.ip), count: Number(h.conns_24h ?? 0),
+    })) as TopItem[],
     top_external_dests: (stats.top_alert_titles ?? []).map((t2) => ({ key: t2.key, count: t2.count })),
-    top_ports: [], protocols: [], top_dns: [], top_http_hosts: [], top_tls_sni: [],
-    rule_stats: [], services: [], live_feed: [], zone_traffic: [], eps_history: [],
-    mttr: [],
-    new_alerts_today: stats.alerts_by_status?.find((s) => s.key === "new")?.count ?? 0,
-    critical_open: stats.alerts_by_severity?.find((s) => s.key === "critical")?.count ?? 0,
-    mean_time_to_ack_min: 0,
+    top_ports: (s.top_ports ?? []) as TopItem[],
+    protocols: (s.protocols ?? []) as unknown as RichOverview["protocols"],
+    top_dns: (s.top_dns ?? []) as TopItem[],
+    top_http_hosts: (s.top_http_hosts ?? []) as TopItem[],
+    top_tls_sni: (s.top_tls_sni ?? []) as TopItem[],
+    rule_stats: [], services,
+    live_feed: [],
+    zone_traffic: (s.zone_traffic ?? []) as unknown as RichOverview["zone_traffic"],
+    eps_history: [],
+    mttr: (s.mttr ?? []) as unknown as RichOverview["mttr"],
+    new_alerts_today: stats.alerts_by_status?.find((s2) => s2.key === "new")?.count ?? 0,
+    critical_open: stats.alerts_by_severity?.find((s2) => s2.key === "critical")?.count ?? 0,
+    mean_time_to_ack_min: (s.mean_time_to_ack_min as number | null) ?? 0,
   };
 }
 
@@ -716,21 +745,22 @@ export async function searchEvents(filters: SearchFilters): Promise<{ total: num
     return { total: hits.length, hits: hits.slice(0, filters.size ?? 50) };
   }
   if (filters.mode === "simple") {
-    const kw = filters.query.trim();
-    const query = kw ? {
-      bool: { should: [
-        { term: { "source.ip": kw } },
-        { term: { "destination.ip": kw } },
-        { match_phrase: { "dns.query": kw } },
-        { match_phrase: { "http.host": kw } },
-        { match_phrase: { "tls.sni": kw } },
-      ] },
-    } : {};
-    return request("/api/events/search", {
-      method: "POST",
-      body: JSON.stringify({ index: filters.index, size: filters.size ?? 50, query,
-                             time_from: filters.time_from }),
-    });
+    // v0.16.1 (P0-5): mode simple TIDAK lagi membangun DSL di client.
+    // Dulu term teks (mis. "dns") dikirim ke field bertipe ip -> parsing
+    // gagal, hasil SELALU 0. Kini kirim query_text; API yang membangun
+    // query benar (event_type fast-path, IP fast-path, wildcard whitelist).
+    return request<{ total: number; relation?: string; hits: EventDoc[] }>(
+      "/api/events/search", {
+        method: "POST",
+        body: JSON.stringify({
+          index: filters.index,
+          size: filters.size ?? 50,
+          query_text: filters.query.trim(),
+          exact_total: filters.exact_total ?? false,
+          time_from: filters.time_from,
+          time_to: filters.time_to,
+        }),
+      });
   }
   // advanced: send raw DSL as query
   let parsed: unknown;
@@ -739,13 +769,16 @@ export async function searchEvents(filters: SearchFilters): Promise<{ total: num
   } catch {
     return { total: 0, hits: [], error: "Invalid JSON in DSL query" };
   }
-  return request("/api/events/search", {
+  return request<{ total: number; relation?: string; hits: EventDoc[] }>(
+    "/api/events/search", {
     method: "POST",
     // v0.13.0: time_to travels too - Verify-in-Event-Search used to open
     // an UNBOUNDED window (only time_from was sent)
+    // v0.16.1 (P2-4): exact_total opsional
     body: JSON.stringify({ index: filters.index, size: filters.size ?? 50,
                            query: parsed, time_from: filters.time_from,
-                           time_to: filters.time_to }),
+                           time_to: filters.time_to,
+                           exact_total: filters.exact_total ?? false }),
   });
 }
 
@@ -1418,6 +1451,17 @@ export async function getRulesSummary(): Promise<RulesSummary> {
   return request<RulesSummary>("/api/rules/summary");
 }
 
+// v0.16.1 (P1-3): status ringan ruleset+sensor (tanpa parsing 45 MB) -
+// sumber KPI kartu Rule Manager, tetap hidup walau parsing lambat/500.
+export async function getRulesStatus(): Promise<RulesStatus | null> {
+  if (DEMO_MODE) return null;
+  try {
+    return await request<RulesStatus>("/api/rules/status");
+  } catch {
+    return null;  // degrade: UI menampilkan "tidak diketahui", bukan klaim
+  }
+}
+
 export async function listRules(params?: {
   q?: string; category?: string; status?: "all" | "enabled" | "disabled";
   source?: "all" | "local" | "suricata";
@@ -1716,4 +1760,73 @@ export async function createPcapExport(body: PcapExportCreate): Promise<PcapExpo
 
 export function pcapExportDownloadUrl(exportId: string): string {
   return `${API_BASE}/api/evidence/pcap/exports/${encodeURIComponent(exportId)}/download`;
+}
+
+// ==================================================================== v0.16.0
+// R6: export alert xlsx/csv (window WAJIB; backend cap EXPORT_MAX_ROWS).
+// Mengembalikan blob untuk di-download sebagai file.
+export async function exportAlerts(body: ExportAlertBody): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/api/alerts/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).detail ?? ""; } catch { /* noop */ }
+    throw new Error(detail || `export failed (${res.status})`);
+  }
+  return res.blob();
+}
+
+// R7: DNS explorer
+export async function getDnsExplorerSummary(hours = 24): Promise<DnsSummary> {
+  return request<DnsSummary>(`/api/dns/summary?hours=${hours}`);
+}
+
+export async function searchDns(body: {
+  time_from?: string; time_to?: string;
+  query?: Record<string, unknown>; filter?: FilterAst;
+  size?: number; from?: number;
+}): Promise<{ total: number; hits: DnsHit[] }> {
+  return request("/api/dns/search", {
+    method: "POST",
+    body: JSON.stringify({ index: "ndr-zeek-dns-read", ...body }),
+  });
+}
+
+// R9: TLS insights
+export async function getTlsSummary(hours = 24): Promise<TlsSummary> {
+  return request<TlsSummary>(`/api/tls/summary?hours=${hours}`);
+}
+
+// R18: Judi Online
+export async function getGamblingSummary(hours = 24): Promise<GamblingSummary> {
+  return request<GamblingSummary>(`/api/gambling/summary?hours=${hours}`);
+}
+
+export async function getGamblingEvents(hours = 24, size = 100): Promise<{
+  total: number; hits: EventDoc[];
+}> {
+  return request(`/api/gambling/events?hours=${hours}&size=${size}`);
+}
+
+// R14+15: rule hit statistics
+export async function getRuleStats(refresh = false): Promise<RuleStatsList> {
+  return request<RuleStatsList>(`/api/rules/stats${refresh ? "?refresh=1" : ""}`);
+}
+
+// R5: search alerts dengan filter DSL AST (di luar preset lama)
+export async function searchAlertsDsl(body: {
+  time_from?: string; time_to?: string;
+  query?: Record<string, unknown>;
+  filter?: FilterAst;
+  size?: number; from?: number;
+  sort?: unknown[];
+}): Promise<{ total: number; relation?: string; hits: { id: string; source: AlertDoc }[] }> {
+  return request("/api/alerts/search", {
+    method: "POST",
+    body: JSON.stringify({ index: "ndr-alerts-read", ...body }),
+  });
 }

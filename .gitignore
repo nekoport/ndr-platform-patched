@@ -1,10 +1,11 @@
-deploy/tls/*.key
-deploy/tls/*.crt
-deploy/tls/ca*
-*.log
+.env
 node_modules/
 .next/
 __pycache__/
 *.pyc
-.playwright-mcp/
+.pytest_cache/
+venv/
 *.tar.gz
+deploy/tls/*.key
+deploy/tls/*.crt
+deploy/tls/*.srl

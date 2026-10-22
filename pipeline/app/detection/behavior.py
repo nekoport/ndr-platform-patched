@@ -285,6 +285,11 @@ class DGADetector(BaseRule):
                 evidence=[],
                 # v0.14.0: structured domain list for whitelist matching
                 dns_domains=list(unique.keys()),
+                # v0.16.0 (req 8): skor DGA ternormalisasi 0-100 dari mean
+                # entropy (2.5 -> 0, 4.5 -> 100) - memudahkan sort/prioritisasi
+                # tanpa mengubah ambang deteksi yang konservatif.
+                dga_score=max(0.0, min(100.0,
+                                       (mean_entropy - 2.5) / 2.0 * 100.0)),
             )
             self.emit(doc)
 
@@ -539,6 +544,145 @@ class LargeOutboundDetector(BaseRule):
                 protocol=None, top_sources=[(src, total)],
                 top_destinations=[(dst, total)], top_rules=[],
                 evidence=[],
+            )
+            self.emit(doc)
+
+
+class AuthBruteforceDetector(BaseRule):
+    """v0.16.0 (requirements 1 & 3): percobaan auth HTTP gagal berulang.
+
+    Menghitung respons 401/403 per (src, dst) dalam window. Setiap unit
+    adalah percobaan yang ditolak (attack_status 'attempt' - server
+    menolak, tapi kampanye percobaannya nyata dan berkelanjutan).
+    """
+
+    name = "auth_bruteforce_suspected"
+
+    def __init__(self, min_failures: int, window_min: int, max_keys: int,
+                 sensor_id: str, sink_queue, index_for_alert):
+        super().__init__(window_min * 60, max_keys, sensor_id, sink_queue,
+                         index_for_alert)
+        self.min_failures = min_failures
+        self._buffer = WindowShim(self.window_seconds * 2, max_keys)
+
+    def feed(self, ev: CommonEvent, index_name: str) -> None:
+        if ev.http_status not in (401, 403) or not ev.source_ip:
+            return
+        key = f"{ev.source_ip}|{ev.destination_ip or '?'}"
+        self._buffer.add(key, ev.event_time.timestamp(),
+                         (ev.http_status, ev.http_host or ev.http_url))
+
+    def sweep(self, now: float) -> None:
+        if not self.flush_due(now):
+            return
+        cutoff = now - self.window_seconds
+        for key in self._buffer.keys():
+            buf = self._buffer.prune_key(key, now)
+            if not buf or buf[-1][0] > cutoff:
+                continue
+            self._buffer.drop_key(key)
+            if len(buf) < self.min_failures:
+                continue
+            src, dst = key.split("|", 1)
+            hosts = sorted({p[1] for _, p in buf if p[1]})[:5]
+            codes = Counter(p[0] for _, p in buf)
+            first = datetime.fromtimestamp(buf[0][0], tz=timezone.utc)
+            last = datetime.fromtimestamp(buf[-1][0], tz=timezone.utc)
+            doc = build_alert_doc(
+                alert_id=make_alert_id(self.name, key, first),
+                alert_type=self.name, attack_phase="initial_access",
+                title=(f"HTTP auth brute force suspected: {src} -> {dst} "
+                       f"({len(buf)} denied auth responses)"),
+                group_key=key, severity="medium",
+                rationale=(
+                    f"Host {src} menerima {len(buf)} respons penolakan "
+                    f"auth HTTP (401/403) dari {dst} dalam window. Pola "
+                    f"gagal-berulang konsisten dengan password guessing / "
+                    f"credential stuffing; bukan bukti akses berhasil."),
+                reasons=[
+                    f"denied auth responses: {len(buf)} >= "
+                    f"{self.min_failures}",
+                    f"status codes: " + ", ".join(
+                        f"{c}x{code}" for code, c in sorted(codes.items())),
+                    *( [f"target hosts: {', '.join(hosts)}"] if hosts else []),
+                ],
+                first_seen=first, last_seen=last, sensor_id=self.sensor_id,
+                event_count=len(buf), source_count=1, destination_count=1,
+                source_ip=src, destination_ip=dst, transport="tcp",
+                protocol="http", top_sources=[(src, len(buf))],
+                top_destinations=[(dst, len(buf))], top_rules=[],
+                evidence=[],
+                # bukti percobaan yang ditolak server -> Attempt (req 3)
+                force_status="attempt",
+            )
+            self.emit(doc)
+
+
+class GamblingAccessDetector(BaseRule):
+    """v0.16.0 (requirement 18): akses ke watchlist Judi Online.
+
+    Feed dari event yang sudah ditandai enrichment GamblingWatchlist
+    (ev.campaign == 'judi-online'). Ini pelanggaran kebijakan, bukan
+    serangan: attack_status dibiarkan indeterminate, severity medium,
+    dan alert membawa campaign + sampel domain untuk laporan.
+    """
+
+    name = "gambling_access"
+
+    def __init__(self, min_hits: int, window_min: int, max_keys: int,
+                 sensor_id: str, sink_queue, index_for_alert):
+        super().__init__(window_min * 60, max_keys, sensor_id, sink_queue,
+                         index_for_alert)
+        self.min_hits = min_hits
+        self._buffer = WindowShim(self.window_seconds * 2, max_keys)
+
+    def feed(self, ev: CommonEvent, index_name: str) -> None:
+        if ev.campaign != "judi-online" or not ev.source_ip:
+            return
+        host = ev.http_host or ev.dns_query or ev.tls_sni or "(unknown)"
+        self._buffer.add(ev.source_ip, ev.event_time.timestamp(),
+                         (host, ev.destination_ip))
+
+    def sweep(self, now: float) -> None:
+        if not self.flush_due(now):
+            return
+        cutoff = now - self.window_seconds
+        for key in self._buffer.keys():
+            buf = self._buffer.prune_key(key, now)
+            if not buf or buf[-1][0] > cutoff:
+                continue
+            self._buffer.drop_key(key)
+            if len(buf) < self.min_hits:
+                continue
+            hosts = Counter(h for _, (h, _) in buf)
+            dsts = Counter(d for _, (_, d) in buf if d)
+            domains = [h for h, _ in hosts.most_common(10)]
+            first = datetime.fromtimestamp(buf[0][0], tz=timezone.utc)
+            last = datetime.fromtimestamp(buf[-1][0], tz=timezone.utc)
+            doc = build_alert_doc(
+                alert_id=make_alert_id(self.name, key, first),
+                alert_type=self.name, attack_phase="unknown",
+                title=(f"Judi Online watchlist: {key} "
+                       f"({len(hosts)} domain, {len(buf)} hits)"),
+                group_key=key, severity="medium",
+                rationale=(
+                    f"Host {key} mengakses {len(hosts)} domain yang cocok "
+                    f"dengan watchlist Judi Online ({len(buf)} hits dalam "
+                    f"window). Aktivitas melanggar kebijakan; bukti "
+                    f"PCAP tersedia via Arkime untuk validasi."),
+                reasons=[
+                    f"watchlist hits: {len(buf)} >= {self.min_hits}",
+                    f"top domains: " + ", ".join(
+                        f"{h} ({c})" for h, c in hosts.most_common(4)),
+                ],
+                first_seen=first, last_seen=last, sensor_id=self.sensor_id,
+                event_count=len(buf), source_count=1,
+                destination_count=len(dsts), source_ip=key,
+                destination_ip=dsts.most_common(1)[0][0] if dsts else None,
+                transport=None, protocol="dns/http",
+                top_sources=[(key, len(buf))],
+                top_destinations=dsts.most_common(), top_rules=[],
+                evidence=[], dns_domains=domains, campaign="judi-online",
             )
             self.emit(doc)
 

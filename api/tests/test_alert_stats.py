@@ -61,10 +61,16 @@ def test_alert_stats_aggregations(client, monkeypatch, _fake_os):
     assert res.status_code == 200
     body = res.json()
     assert body["total"] == 45
-    assert body["severity"]["critical"] == 2
-    assert body["severity"]["high"] == 10
-    assert body["status"]["new"] == 40
-    assert body["outcome"]["attempted"] == 45
+    # v0.16.0 (bug A6 fix): kontrak UI = LIST {key,count} urut count desc;
+    # bentuk dict 0.13.0 dipindah ke body["aggregations"] agar dua
+    # generasi kontrak aman berdampingan.
+    assert body["severity"][0] == {"key": "medium", "count": 33}
+    assert {b["key"]: b["count"] for b in body["severity"]}["critical"] == 2
+    assert {b["key"]: b["count"] for b in body["severity"]}["high"] == 10
+    assert body["status"][0] == {"key": "new", "count": 40}
+    assert body["outcome"][0] == {"key": "attempted", "count": 45}
+    # bentuk dict lama masih tersedia di bawah aggregations.*
+    assert body["aggregations"]["severity"]["critical"] == 2
     assert body["new_count"] == 40
     assert body["critical_count"] == 2
     assert body["mitre"][0] == ["T1110", "Brute Force", 12]

@@ -51,7 +51,20 @@ app.include_router(evidence.router)
 app.include_router(settings.router)
 from app.routers import allowlist  # noqa: E402 - v0.14.0 alert whitelist
 app.include_router(allowlist.router)
-from app.routers import arkime_proxy  # noqa: E402 - NDR SSO Arkime proxy
+
+# ------------------------------------------------- v0.16.0 wiring (req 5-19)
+# Router 0.16.0 - semuanya guarded di dalam router masing-masing
+# (alias whitelist, DSL guard, permission dependency), jadi pendaftaran
+# selalu aktif dan error degrade 502 - bukan 500 - bila backend mati.
+from app.routers import dns, gambling, metrics_live, tls  # noqa: E402
+app.include_router(dns.router)
+app.include_router(tls.router)
+app.include_router(gambling.router)
+app.include_router(metrics_live.router)
+# SSO proxy Arkime (req 13, BAKED sejak 0.16.0): router sendiri membalas
+# 503 "SSO viewer not configured" bila ARKIME_PROXY_SECRET kosong, jadi
+# fresh install tanpa Arkime tetap sehat.
+from app.routers import arkime_proxy  # noqa: E402
 app.include_router(arkime_proxy.router)
 
 
@@ -94,11 +107,31 @@ def on_startup() -> None:
     _migrate_doc11_columns()
     _migrate_v012_columns()
     _migrate_ti_adapter_check()
+    _migrate_v016_columns()
     db = SessionLocal()
     try:
         bootstrap_admin(db)
     finally:
         db.close()
+    # v0.16.0 (req 14/15): background refresher statistik hit per rule.
+    # INTERVAL=0 mematikan (env RULE_STATS_REFRESH_MIN); daemon fail-soft
+    # dan tidak pernah menghalangi startup.
+    if config.rule_stats_refresh_minutes > 0:
+        from app.rule_stats import RuleStatsRefresher
+        app.state.rule_stats_refresher = RuleStatsRefresher(
+            config.rule_stats_refresh_minutes)
+        app.state.rule_stats_refresher.start()
+
+
+def _migrate_v016_columns() -> None:
+    """v0.16.0 schema extras (idempoten, inspector-guarded).
+
+    create_all menangani tabel BARU (rule_stats); fungsi ini untuk
+    perubahan pada tabel lama yang mungkin ada di database 0.12-0.15.
+    Saat ini: tidak ada kolom baru pada tabel lama - disiapkan sebagai
+    titik migrasi yang sudah teruji polanya (lihat _migrate_v012_columns).
+    """
+    return
 
 
 def _migrate_doc11_columns() -> None:
@@ -192,3 +225,23 @@ async def unhandled(request: Request, exc: Exception):
 def meta():
     return {"service": "ndr-api", "version": __version__,
             "phase": "0-5-threat-map-correlation"}
+
+
+# v0.16.1 (P2-7): GET /api/version tadinya 404 sehingga versi terpasang
+# tidak bisa diverifikasi dari API. Endpoint ini ringan (tanpa auth supaya
+# bisa dicek dari skrip deploy sebelum login) dan TIDAK membocorkan data.
+@app.get("/api/version")
+def version():
+    import platform
+    import sys
+
+    from app.config import config as _cfg
+    return {
+        "service": "ndr-api",
+        "version": __version__,
+        "api": __version__,
+        "python": sys.version.split(" ")[0],
+        "platform": platform.platform(),
+        "sensor_id": _cfg.sensor_id,
+        "sso_configured": bool(_cfg.arkime_proxy_secret),
+    }

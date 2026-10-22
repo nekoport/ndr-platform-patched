@@ -33,13 +33,16 @@ import {
 } from "./shared";
 import type { TimeRange } from "./shared";
 import {
-  ChevronRight, Filter, Loader2, Search, Swords, Timer, Waypoints, Zap,
+  ChevronRight, Download, Filter, Loader2, Search, SlidersHorizontal,
+  Swords, Timer, Waypoints, X, Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { alertStats, escalateAlert, searchAlerts } from "@/lib/ndr/api";
-import type { AlertDoc, AlertStats } from "@/lib/ndr/types";
+import { alertStats, escalateAlert, exportAlerts, searchAlerts,
+  searchAlertsDsl } from "@/lib/ndr/api";
+import type { AlertDoc, AlertStats, FilterAst } from "@/lib/ndr/types";
 import { AlertDetailSheet, protocolOf } from "./alert-detail";
 import type { VerifyEventRequest } from "./alert-detail";
+import { FilterBuilderDialog, filterSummary, sanitizeFilterAst } from "./filter-builder";
 import { cn } from "@/lib/utils";
 
 const OUTCOME_FILTERS = [
@@ -85,6 +88,11 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
   const [total, setTotal] = useState(0);
   const [selected, setSelected] = useState<AlertDoc | null>(null);
 
+  // v0.16.0 (req 5): filter DSL kustom + (req 6) export dialog state
+  const [dslFilter, setDslFilter] = useState<FilterAst | null>(null);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [exporting, setExporting] = useState<"csv" | "xlsx" | null>(null);
+
   // pagination (server-driven)
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
@@ -106,6 +114,19 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
       // v0.14.0: whitelist-suppressed (L1) alerts opt-in
       show_suppressed: showSuppressed,
     };
+  };
+
+  // v0.16.0 (req 5): bila filter DSL aktif, tabel memakai jalur
+  // /api/alerts/search dgn `filter` AST (di ATAS preset lama).
+  const fetchDsl = async (size: number, from: number) => {
+    const w = resolveTimeRange(timeRange);
+    const res = await searchAlertsDsl({
+      size, from,
+      time_from: w.from ?? undefined,
+      time_to: w.to ?? undefined,
+      filter: dslFilter ?? undefined,
+    });
+    return { total: res.total, hits: res.hits.map((h) => h.source) };
   };
 
   // analytics windows: exact buckets from the /stats aggregation + a
@@ -131,14 +152,18 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
   const fetchPage = async (p: number, s: number) => {
     setLoading(true);
     try {
-      const res = await searchAlerts(buildFilters(s, (p - 1) * s));
+      const res = dslFilter
+        ? await fetchDsl(s, (p - 1) * s)
+        : await searchAlerts(buildFilters(s, (p - 1) * s));
       setAlerts(res.hits);
       setTotal(res.total);
       // result set shrank under us - snap back to the last valid page
       if (res.total > 0 && (p - 1) * s >= res.total) {
         const last = Math.max(1, Math.ceil(res.total / s));
         setPage(last);
-        const again = await searchAlerts(buildFilters(s, (last - 1) * s));
+        const again = dslFilter
+          ? await fetchDsl(s, (last - 1) * s)
+          : await searchAlerts(buildFilters(s, (last - 1) * s));
         setAlerts(again.hits);
       }
     } catch (e) {
@@ -158,6 +183,39 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
   useEffect(() => { load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [severity, status, outcome, timeRange]);
   // v0.14.0: "Show suppressed" toggles the whitelist filter
   useEffect(() => { load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [showSuppressed]);
+  // v0.16.0: filter DSL change re-fetches the table (analytics tetap
+  // dari preset lama - buckets header untuk keseluruhan hasil filter)
+  useEffect(() => { load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [dslFilter]);
+
+  // v0.16.0 (req 6): export xlsx/csv - window waktu aktif + filter DSL
+  const doExport = async (format: "csv" | "xlsx") => {
+    setExporting(format);
+    try {
+      const w = resolveTimeRange(timeRange);
+      const blob = await exportAlerts({
+        format,
+        time_from: w.from ?? new Date(Date.now() - 86_400_000).toISOString(),
+        time_to: w.to ?? new Date().toISOString(),
+        filter: dslFilter ?? undefined,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ndr-alerts-${new Date().toISOString().slice(0, 19)
+        .replace(/[:T]/g, "")}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast({ title: `Export ${format.toUpperCase()} siap`,
+        description: "File diunduh; jumlah baris dicatat di audit log." });
+    } catch (e) {
+      toast({ title: "Export gagal", description: String(e),
+        variant: "destructive" });
+    } finally {
+      setExporting(null);
+    }
+  };
 
   // v0.12.8: status/notes updates live inside AlertDetailSheet; the
   // updated document is synced back into the list states here.
@@ -319,11 +377,60 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
           </SelectContent>
         </Select>
         <TimeRangePicker value={timeRange} onChange={setTimeRange} />
+        {/* v0.16.0 (req 5): filter kustom DSL */}
+        <Button
+          onClick={() => setFilterOpen(true)}
+          variant={dslFilter ? "secondary" : "outline"}
+          className={dslFilter
+            ? "border-sky-600 bg-sky-950/60 text-sky-300 hover:bg-sky-900/60"
+            : "border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"}>
+          <SlidersHorizontal className="mr-1.5 h-4 w-4" />
+          Filter kustom
+        </Button>
         <Button onClick={load} variant="outline"
                 className="border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800">
           <Filter className="mr-1.5 h-4 w-4" /> Apply
         </Button>
+        {/* v0.16.0 (req 6): export */}
+        <Button
+          variant="outline"
+          disabled={exporting !== null}
+          onClick={() => void doExport("xlsx")}
+          className="border-emerald-800 bg-emerald-950/40 text-emerald-300
+                     hover:bg-emerald-900/40"
+          title="Export hasil sesuai filter aktif ke .xlsx (req 6)">
+          {exporting === "xlsx"
+            ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+            : <Download className="mr-1.5 h-4 w-4" />}
+          XLSX
+        </Button>
+        <Button
+          variant="outline"
+          disabled={exporting !== null}
+          onClick={() => void doExport("csv")}
+          className="border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
+          title="Export hasil sesuai filter aktif ke .csv (req 6)">
+          {exporting === "csv"
+            ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+            : <Download className="mr-1.5 h-4 w-4" />}
+          CSV
+        </Button>
       </div>
+
+      {dslFilter && (
+        <div className="flex items-center gap-2 rounded-lg border border-sky-900/60
+                        bg-sky-950/30 px-3 py-2 text-xs text-sky-300">
+          <SlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate flex-1 font-mono">
+            {filterSummary(dslFilter)}
+          </span>
+          <button className="text-zinc-400 hover:text-zinc-200"
+                  title="Hapus filter kustom"
+                  onClick={() => setDslFilter(null)}>
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-2 text-xs text-zinc-500">
         <Badge variant="outline" className="border-sky-900 bg-sky-950/60 text-sky-300"
@@ -489,6 +596,13 @@ export function AlertsView({ canEdit, onOpenThreatMap, onOpenIncident, onVerifyE
                         onOpenIncident={onOpenIncident}
                         onVerifyEvents={onVerifyEvents}
                         onEscalate={(a) => { setEscTarget(a); setEscReason(""); }} />
+
+      {/* v0.16.0 (req 5): custom filter DSL builder */}
+      {/* v0.16.1 (P0-3): AST dinormalisasi saat masuk state - elemen null
+          tidak pernah bisa sampai ke .map pembaca .field di mana pun. */}
+      <FilterBuilderDialog open={filterOpen} onOpenChange={setFilterOpen}
+                           initial={dslFilter}
+                           onApply={(ast) => setDslFilter(sanitizeFilterAst(ast))} />
     </div>
   );
 }

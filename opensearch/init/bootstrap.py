@@ -110,6 +110,8 @@ COMMON_EVENT_FIELDS = {
     "raw_event_ref": {"type": "keyword"},
     "parse_status": {"type": "keyword"},
     "parser_version": {"type": "keyword"},
+    # v0.16.0 (req 18): campaign tag dari watchlist (mis. judi-online)
+    "campaign": {"type": "keyword"},
     "dns": {
         "properties": {
             "query": {"type": "wildcard"},
@@ -257,6 +259,57 @@ ALERT_FIELDS = {
             "ioc_source": {"type": "keyword"},
             "confidence": {"type": "keyword"},
             "match_field": {"type": "keyword"},
+        }
+    },
+    # ------------------------------------------------- v0.16.0 (req 1/3/8/10/18)
+    # status keberhasilan kosakata tender + label mesin deteksi + CVE +
+    # skor DGA + campaign; penjelasan display-only (index:false, diet).
+    "attack_status": {"type": "keyword"},
+    "detection_engine": {"type": "keyword"},
+    "cve": {"type": "keyword"},
+    "dga_score": {"type": "float"},
+    "campaign": {"type": "keyword"},
+    "explanation": {"type": "keyword", "index": false},
+    # ------------------------------------------------- v0.16.0 (req 4/10/12)
+    # FIX: builder alert sudah sejak 0.12 menulis mitre/kill_chain/
+    # attack_phase, tetapi mapping tidak pernah mendeklarasikannya -
+    # dengan dynamic:false ketiganya TIDAK terindeks sehingga agregasi
+    # by_mitre/by_kill_chain di /api/alerts/stats gagal di OS live
+    # ("No mapping found"). Didaftarkan sekarang (idempoten, template
+    # di-update oleh bootstrap; index baru langsung kaya).
+    "attack_phase": {"type": "keyword"},
+    "kill_chain": {
+        "properties": {
+            "stage": {"type": "keyword"},
+            "stage_label": {"type": "keyword"},
+            "basis": {"type": "keyword", "index": false},
+            "reason": {"type": "keyword", "index": false},
+        }
+    },
+    "mitre": {
+        "properties": {
+            "technique_id": {"type": "keyword"},
+            "technique": {"type": "keyword"},
+            "tactic": {"type": "keyword"},
+        }
+    },
+    # req 12: geo/ASN pada alert (flattened dari event terbaik). Keyword
+    # saja - peta tetap hidup dari ndr-events geo_point; tooltip detail
+    # alert cukup negara/kota/ASN/org (diet indeks patuh).
+    "geo_src": {
+        "properties": {
+            "country": {"type": "keyword"},
+            "country_iso_code": {"type": "keyword"},
+            "city": {"type": "keyword"},
+            "asn_org": {"type": "keyword"},
+        }
+    },
+    "geo_dst": {
+        "properties": {
+            "country": {"type": "keyword"},
+            "country_iso_code": {"type": "keyword"},
+            "city": {"type": "keyword"},
+            "asn_org": {"type": "keyword"},
         }
     },
 }

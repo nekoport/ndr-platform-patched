@@ -329,7 +329,7 @@ def _sessions_response(scope: str, scope_id: str, ips: list[str],
                          "window are exported, not a packet-precise "
                          "slice. Use the Arkime viewer for packet "
                          "precision."},
-        "arkime_viewer_url": viewer_base_url(),
+        "arkime_viewer_url": viewer_base_url(),  # v0.16.0: public base
         "arkime": _arkime_block(ips, domains, t_from, t_to),
         "capture_buffer_minutes": config.pcap_session_buffer_minutes,
         "sessions": rows,
@@ -340,7 +340,7 @@ def _sessions_response(scope: str, scope_id: str, ips: list[str],
 @router.get("/pcap/storage")
 def pcap_storage(user: User = Depends(require_permission("view"))):
     return {**_capture_window(), "granularity": GRANULARITY,
-            "arkime_viewer_url": viewer_base_url()}
+            "arkime_viewer_url": viewer_base_url()}  # v0.16.0: public base
 
 
 @router.get("/arkime/status")

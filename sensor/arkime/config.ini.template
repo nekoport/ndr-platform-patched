@@ -1,6 +1,8 @@
 # Arkime config template - rendered by entrypoint.sh
 # Placeholders: @OPENSEARCH_URL@ @CAPTURE_IFACE@ @PASSWORD_SECRET@
-#               @FREESPACE_G@ @VIEW_PORT@ @PROXY_SECRET@
+#               @FREESPACE_G@ @VIEW_PORT@
+# v0.16.0 (req 13, BAKED): @WEB_BASE_PATH@ + optional header-auth block
+# rendered from ARKIME_PUBLIC_BASE / ARKIME_PROXY_SECRET (see entrypoint).
 
 [default]
 elasticsearch=@OPENSEARCH_URL@
@@ -26,17 +28,10 @@ logUnknownProtocols=false
 logESRequests=true
 logHTTPConnections=false
 viewHost=0.0.0.0
-# SSO via NDR API proxy (header auth): the viewer accepts ONLY requests
-# carrying BOTH headers below (direct browser hits get 401); the proxy
-# asserts the NDR username so the same login works with no second password.
-# Unknown users auto-provision on first jump (roles below, packetSearch on).
-userNameHeader=x-ndr-user
-requiredAuthHeader=x-ndr-proxy-key
-requiredAuthHeaderVal=@PROXY_SECRET@
-userAutoCreateTmpl={"userId":"${this['x-ndr-user']}","userName":"${this['x-ndr-user']}","enabled":true,"webEnabled":true,"headerAuthEnabled":true,"emailSearch":true,"removeEnabled":false,"packetSearch":true,"settings":{},"welcomeMsgNum":1,"roles":["arkimeUser","wiseUser"]}
-# MUST carry a trailing slash: Arkime emits it verbatim as <base href>
-# in the HTML shell, and a slash-less base makes browsers resolve
-# relative asset URLs one segment too high (blank white page).
-webBasePath=/backend/api/arkime/
-# API proxy lives on docker bridge nets; the header secret stays mandatory.
-userAuthIps=127.0.0.0/8,172.16.0.0/12,::1
+# ---------------------------------------------------------------------
+# v0.16.0 SSO (req 13): viewer selalu dilayani DI BAWAH base path publik
+# yang sama dengan proxy API. GOTCHA #1 (terbukti di lapangan): trailing
+# slash WAJIB - tanpa slash, asset viewer 404 -> halaman putih kosong.
+webBasePath=@WEB_BASE_PATH@
+userAuthMode=form
+@HEADER_AUTH_BLOCK@
